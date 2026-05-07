@@ -2,111 +2,168 @@
 #include <Wire.h>
 #include <Motoron.h>
 
-// --- 宏定义参数 ---
-#define KILL_SWITCH_PIN 13   
-#define LINE_THRESHOLD  600  
-#define BASE_SPEED      300  
-#define TURN_SPEED      500  
-#define SLOW_SPEED      50   
+// ==========================================
+// 1. 宏定义与参数配置
+// ==========================================
+#define KILL_SWITCH_PIN 13   // 红色机械轴连接 D13
+#define LINE_THRESHOLD  700  // 黑线阈值
+#define BASE_SPEED      300  // 直行速度
+#define TURN_SPEED      550  // 转弯时外侧轮速度
+#define SLOW_SPEED      50   // 转弯时内侧轮速度
 #define NUM_SENSORS     3
 
+// --- 引脚分配 ---
+// 传感器 1, 5, 9 分别连接到 D12, D11, D10
+// s[0]: 右(D10), s[1]: 中(D11), s[2]: 左(D12)
 const int dataPins[NUM_SENSORS] = {10, 11, 12}; 
-const uint8_t RF = 1, RR = 2, LR = 3, LF = 4;
 
+// --- 电机通道 ---
+const uint8_t RF = 1; // 右前
+const uint8_t RR = 2; // 右后
+const uint8_t LR = 3; // 左后
+const uint8_t LF = 4; // 左前
+
+// 实例化驱动
 MotoronI2C mc;
 
 // --- 状态变量 ---
-volatile bool isRunning = true;  // 初始设为正在运行
-volatile unsigned long lastInterruptTime = 0; // 用于去抖
+volatile bool isRunning = true;         // 机器人运行状态
+volatile unsigned long lastDebounce = 0; // 用于按键去抖
 
-// --- 函数原型 ---
+// ==========================================
+// 2. 函数原型声明
+// ==========================================
 void init_hardware(void);
 void read_reflectance(unsigned long *durations);
 void drive_motors(int16_t left, int16_t right);
 void handle_button_press(void);
 
+// ==========================================
+// 3. 主初始化函数
+// ==========================================
 void setup() {
     Serial.begin(115200);
     
-    // 1. 初始化开关，设为中断
+    // 初始化开关引脚（输入上拉模式）
     pinMode(KILL_SWITCH_PIN, INPUT_PULLUP);
+    // 绑定中断：下降沿触发（按下瞬间），执行切换函数
     attachInterrupt(digitalPinToInterrupt(KILL_SWITCH_PIN), handle_button_press, FALLING);
 
-    // 2. Motoron 初始化
+    // 初始化 I2C 总线 (使用 Wire1)
     Wire1.begin();
     mc.setBus(&Wire1);
+    
+    // 初始化 Motoron 控制器
     mc.reinitialize();
     mc.disableCrc();
     mc.clearResetFlag();
 
+    // 配置四个电机的加速度限制，防止起步过猛
     for (uint8_t i = 1; i <= 4; i++) {
         mc.setMaxAcceleration(i, 400);
-        mc.setMaxDeceleration(i, 800); // 停止时稍快一点
+        mc.setMaxDeceleration(i, 800);
     }
 
-    Serial.println("System Ready. Press Red Switch to Toggle Stop/Run.");
+    Serial.println("System Ready!");
+    Serial.println("Press Red Switch to toggle RUN/PAUSE.");
 }
 
+// ==========================================
+// 4. 主循环逻辑
+// ==========================================
 void loop() {
-    // A. 如果状态是停止，则强制切断动力并跳过后续逻辑
+    // A. 检查运行状态
     if (!isRunning) {
+        // 如果被暂停，强制停止电机并跳过本轮循环
         drive_motors(0, 0);
-        Serial.println(">>> PAUSED - Press Switch to Resume");
-        delay(200); // 降低打印频率
+        Serial.println(">>> [PAUSED] - Press button to start");
+        delay(200); 
         return; 
     }
 
-    // B. 正常运行逻辑
+    // B. 读取传感器原始数据
     unsigned long s[NUM_SENSORS];
     read_reflectance(s);
 
-    // 巡线决策逻辑
-    if (s[2] > LINE_THRESHOLD) {        // 左
+    // C. 串口打印数值（方便调试阈值）
+    Serial.print("L: "); Serial.print(s[2]);
+    Serial.print(" | M: "); Serial.print(s[1]);
+    Serial.print(" | R: "); Serial.print(s[0]);
+
+    // D. 巡线决策逻辑
+    if (s[2] > LINE_THRESHOLD) {
+        // 左边感应到黑线 -> 向左转
         drive_motors(SLOW_SPEED, TURN_SPEED);
+        Serial.println(" -> ACTION: LEFT");
     } 
-    else if (s[0] > LINE_THRESHOLD) {   // 右
+    else if (s[0] > LINE_THRESHOLD) {
+        // 右边感应到黑线 -> 向右转
         drive_motors(TURN_SPEED, SLOW_SPEED);
+        Serial.println(" -> ACTION: RIGHT");
     } 
-    else if (s[1] > LINE_THRESHOLD) {   // 中
+    else if (s[1] > LINE_THRESHOLD) {
+        // 中间感应到黑线 -> 稳定直行
         drive_motors(BASE_SPEED, BASE_SPEED);
+        Serial.println(" -> ACTION: STRAIGHT");
     } 
-    else {                              // 丢线
+    else {
+        // 全部没看到黑线 -> 停止寻找
         drive_motors(0, 0);
+        Serial.println(" -> ACTION: LOST/STOP");
     }
 
-    delay(20);
+    delay(20); // 采样频率约为 50Hz
 }
 
 // ==========================================
-// 中断服务：切换 跑/停 状态
+// 5. 功能函数具体实现
 // ==========================================
+
+/**
+ * 按钮中断服务函数：实现短按切换模式
+ */
 void handle_button_press() {
-    unsigned long interruptTime = millis();
-    // 简单的去抖逻辑：200毫秒内的连续触发被视为无效
-    if (interruptTime - lastInterruptTime > 200) {
-        isRunning = !isRunning; // 翻转布尔值
+    unsigned long now = millis();
+    // 软件去抖：两次有效触发必须间隔 200ms 以上
+    if (now - lastDebounce > 200) {
+        isRunning = !isRunning; // 状态取反
     }
-    lastInterruptTime = interruptTime;
+    lastDebounce = now;
 }
 
-// ==========================================
-// 其它功能函数 (与之前相同)
-// ==========================================
+/**
+ * 读取反射率传感器（RC放电计时逻辑）
+ */
 void read_reflectance(unsigned long *durations) {
     for (int i = 0; i < NUM_SENSORS; i++) {
-        pinMode(dataPins[i], OUTPUT);
-        digitalWrite(dataPins[i], HIGH);
+        int pin = dataPins[i];
+        
+        // 1. 充电：将引脚设为输出并拉高 10us
+        pinMode(pin, OUTPUT);
+        digitalWrite(pin, HIGH);
         delayMicroseconds(10);
-        pinMode(dataPins[i], INPUT);
+        
+        // 2. 计时：切换为输入，测量变低的时间
+        pinMode(pin, INPUT);
         unsigned long startTime = micros();
-        while (digitalRead(dataPins[i]) == HIGH && (micros() - startTime) < 3000);
+        
+        // 3. 阻塞等待：直到电平变低或达到 3000us 超时
+        while (digitalRead(pin) == HIGH && (micros() - startTime) < 3000);
+        
         durations[i] = micros() - startTime;
     }
 }
 
+/**
+ * 电机驱动控制
+ * 已经整合了你要求的反向修正 (-left, -right)
+ */
 void drive_motors(int16_t left, int16_t right) {
+    // 左侧：M3(LR), M4(LF)
     mc.setSpeed(LR, -left);
     mc.setSpeed(LF, -left);
+    
+    // 右侧：M1(RF), M2(RR)
     mc.setSpeed(RF, -right);
     mc.setSpeed(RR, -right);
 }
