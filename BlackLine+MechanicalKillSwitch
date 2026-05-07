@@ -5,7 +5,7 @@
 // --- 宏定义参数 ---
 #define KILL_SWITCH_PIN 13   
 #define LINE_THRESHOLD  600  
-#define BASE_SPEED      350  // 基础速度
+#define BASE_SPEED      550  // 基础速度
 #define FAST_TURN       550  // 大转弯速度
 #define SLOW_TURN       400  // 小修正速度
 #define INNER_WHEEL     50   // 转弯时内侧轮速度
