@@ -1,101 +1,4 @@
-//C++ version
-#include <Arduino.h>
-#include <Wire.h>
-#include <Motoron.h>
-
-// --- 传感器配置 ---
-const int dataPins[] = {10, 11, 12}; // 0:Right, 1:Medium, 2:Left
-const int numSensors = 3;
-const int LINE_THRESHOLD = 500;      // 识别黑线的阈值
-
-// --- 电机驱动配置 ---
-MotoronI2C mc;
-const uint8_t RIGHT_FRONT = 1; 
-const uint8_t RIGHT_REAR  = 2; 
-const uint8_t LEFT_REAR   = 3; 
-const uint8_t LEFT_FRONT  = 4;
-
-const int16_t MOVE_SPEED = 400;      // 前进速度
-
-void setup() {
-  Serial.begin(115200);
-  
-  // 初始化 Motoron (使用 Wire1)
-  Wire1.begin();
-  mc.setBus(&Wire1);
-  mc.reinitialize();
-  mc.disableCrc();
-  mc.clearResetFlag();
-
-  // 设置加减速，让动作更平稳
-  for (int i = 1; i <= 4; i++) {
-    mc.setMaxAcceleration(i, 400);
-    mc.setMaxDeceleration(i, 600);
-  }
-
-  stopAllMotors();
-  Serial.println("Robot Ready: Moving forward when Black Line detected on Medium sensor.");
-}
-
-void loop() {
-  // 1. 读取传感器数据
-  unsigned long durations[3];
-  readReflectance(durations);
-
-  unsigned long mediumValue = durations[1]; // 中间传感器的值
-
-  // 2. 串口打印调试信息
-  Serial.print("Sensor Values -> Left: "); Serial.print(durations[2]);
-  Serial.print(" | Medium: "); Serial.print(mediumValue);
-  Serial.print(" | Right: "); Serial.print(durations[0]);
-
-  // 3. 逻辑判断
-  if (mediumValue > LINE_THRESHOLD) {
-    Serial.println(" [ STATUS: BLACK LINE FOUND - MOVING FORWARD ]");
-    moveForward(MOVE_SPEED);
-  } else {
-    Serial.println(" [ STATUS: NO LINE - STOPPED ]");
-    stopAllMotors();
-  }
-
-  delay(50); // 稍微缩短延迟，提高反应速度
-}
-
-// --- 功能函数库 ---
-
-// 读取反射率传感器（RC放电耗时逻辑）
-void readReflectance(unsigned long* duration) {
-  for (int i = 0; i < numSensors; i++) {
-    pinMode(dataPins[i], OUTPUT);
-    digitalWrite(dataPins[i], HIGH);
-    delayMicroseconds(10); 
-    pinMode(dataPins[i], INPUT);
-    unsigned long startTime = micros();
-    // 等待引脚变低或超时（3000微秒）
-    while (digitalRead(dataPins[i]) == HIGH && (micros() - startTime) < 3000);
-    duration[i] = micros() - startTime;
-  }
-}
-
-// 所有电机停止
-void stopAllMotors() {
-  mc.setSpeed(RIGHT_FRONT, 0);
-  mc.setSpeed(RIGHT_REAR, 0);
-  mc.setSpeed(LEFT_REAR, 0);
-  mc.setSpeed(LEFT_FRONT, 0);
-}
-
-// 直线前进
-void moveForward(int16_t speed) {
-  mc.setSpeed(RIGHT_FRONT, speed);
-  mc.setSpeed(RIGHT_REAR,  speed);
-  mc.setSpeed(LEFT_REAR,   speed);
-  mc.setSpeed(LEFT_FRONT,  speed);
-}
-
-
-
-//C version
+//C version 1
 #include <Arduino.h>
 #include <Wire.h>
 #include <Motoron.h>
@@ -183,4 +86,58 @@ void read_sensors(unsigned long *durations) {
         while (digitalRead(pin) == HIGH && (micros() - start_time) < 3000);
         durations[i] = micros() - start_time;
     }
+}
+
+//C version 2
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Motoron.h>
+
+#define LINE_THRESHOLD 400
+#define BASE_SPEED 350
+#define TURN_SPEED 550
+#define SLOW_SPEED 50
+#define NUM_SENSORS 3
+
+const int dataPins[NUM_SENSORS] = {10, 11, 12}; 
+MotoronI2C mc;
+
+void set_motors(int16_t left, int16_t right) {
+    mc.setSpeed(3, -left);  // LR
+    mc.setSpeed(4, -left);  // LF
+    mc.setSpeed(1, -right); // RF
+    mc.setSpeed(2, -right); // RR
+}
+
+void loop() {
+    unsigned long s[NUM_SENSORS];
+    if (s[2] > LINE_THRESHOLD && s[0] > LINE_THRESHOLD) {
+        // 如果左右同时看到黑线
+        // 这种情况下优先直行，或者稍微减速
+        set_motors(BASE_SPEED, BASE_SPEED);
+        Serial.println("ALL BLACK - FORWARD");
+    }
+    else if (s[2] > LINE_THRESHOLD) {
+        // 只有左边看到黑线 -> 向左转
+        set_motors(SLOW_SPEED, TURN_SPEED);
+        Serial.println("STRONGLY TURN LEFT");
+    } 
+    else if (s[0] > LINE_THRESHOLD) {
+        // 只有右边看到黑线 -> 向右转
+        set_motors(TURN_SPEED, SLOW_SPEED);
+        Serial.println("STRONGLY TURN RIGHT");
+    } 
+    else if (s[1] > LINE_THRESHOLD) {
+        // 只有中间看到黑线 -> 完美直行
+        set_motors(BASE_SPEED, BASE_SPEED);
+        Serial.println("PERFECT FORWARD");
+    } 
+    else {
+        // 全白：丢失目标
+        set_motors(0, 0);
+        Serial.println("LOST");
+    }
+
+    delay(30);
 }
