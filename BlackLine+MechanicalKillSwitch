@@ -3,7 +3,7 @@
 #include <Wire.h>
 #include <Motoron.h>
 
-#define LINE_THRESHOLD 500
+#define LINE_THRESHOLD 800
 #define MOVE_SPEED 400
 #define NUM_SENSORS 3
 
@@ -94,7 +94,7 @@ void read_sensors(unsigned long *durations) {
 #include <Motoron.h>
 
 #define KILL_SWITCH_PIN 13   // 红色机械轴连接 D13
-#define LINE_THRESHOLD  400  // 黑线阈值 (根据你的间距调整)
+#define LINE_THRESHOLD  800  // 黑线阈值 (根据你的间距调整)
 #define BASE_SPEED      300  // 直行基准速度
 #define TURN_SPEED      500  // 转弯时外侧轮速度
 #define SLOW_SPEED      50   // 转弯时内侧轮速度
