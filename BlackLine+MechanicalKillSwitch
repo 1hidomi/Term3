@@ -2,27 +2,24 @@
 #include <Wire.h>
 #include <Motoron.h>
 
+// --- 宏定义参数 ---
 #define KILL_SWITCH_PIN 13   
 #define LINE_THRESHOLD  600  
-#define BASE_SPEED      300  
-#define TURN_SPEED      550  
-#define SLOW_SPEED      50   
-#define SCAN_SPEED      400 
-#define NUM_SENSORS     3
+#define BASE_SPEED      350  // 基础速度
+#define FAST_TURN       550  // 大转弯速度
+#define SLOW_TURN       400  // 小修正速度
+#define INNER_WHEEL     50   // 转弯时内侧轮速度
+#define SCAN_SPEED      350  
+#define NUM_SENSORS     5    // 升级为 5 个
 
-const int dataPins[NUM_SENSORS] = {10, 11, 12}; 
+const int dataPins[NUM_SENSORS] = {12, 28, 11, 30, 10};
+
 const uint8_t RF = 1, RR = 2, LR = 3, LF = 4;
-
 MotoronI2C mc;
 
 volatile bool isRunning = true;         
 volatile unsigned long lastDebounce = 0; 
-int lastDirection = 0; // 0: 中间, 1: 右偏(需左转), 2: 左偏(需右转)
-
-void init_hardware(void);
-void read_reflectance(unsigned long *durations);
-void drive_motors(int16_t left, int16_t right);
-void handle_button_press(void);
+int lastDirection = 0; // 0:中, 1:偏左, 2:偏右
 
 void setup() {
     Serial.begin(115200);
@@ -36,62 +33,58 @@ void setup() {
     mc.clearResetFlag();
 
     for (uint8_t i = 1; i <= 4; i++) {
-        mc.setMaxAcceleration(i, 500); // 略微调高加速度，让转向更敏捷
+        mc.setMaxAcceleration(i, 600); 
         mc.setMaxDeceleration(i, 800);
     }
-    Serial.println("90-Degree Turn Optimized System Ready!");
 }
 
 void loop() {
-    if (!isRunning) {
-        drive_motors(0, 0);
-        return; 
-    }
+    if (!isRunning) { drive_motors(0, 0); return; }
 
     unsigned long s[NUM_SENSORS];
     read_reflectance(s);
 
-    // --- 巡线决策逻辑 (带记忆功能) ---
+    // --- 5 传感器巡线决策逻辑 ---
+    // s[0]:最右(9), s[1]:偏右(7), s[2]:中(5), s[3]:偏左(3), s[4]:最左(1)
 
-    if (s[1] > LINE_THRESHOLD) {
-        // 中间看到线：直行，重置方向记忆为“直行”
+    if (s[2] > LINE_THRESHOLD) {
+        // 中间触发：直线冲锋
         drive_motors(BASE_SPEED, BASE_SPEED);
-        lastDirection = 0; 
-        Serial.println("STRAIGHT");
+        lastDirection = 0;
     } 
-    else if (s[2] > LINE_THRESHOLD) {
-        // 左边看到线：向左修正，记忆“最后在左边”
-        drive_motors(SLOW_SPEED, TURN_SPEED);
-        lastDirection = 1; 
-        Serial.println("TURN LEFT");
+    else if (s[3] > LINE_THRESHOLD) {
+        // 3号触发：小幅左转修正
+        drive_motors(SLOW_TURN, BASE_SPEED); 
+        lastDirection = 1;
+    } 
+    else if (s[4] > LINE_THRESHOLD) {
+        // 1号触发：大幅左转 (应对 90 度弯)
+        drive_motors(INNER_WHEEL, FAST_TURN);
+        lastDirection = 1;
+    } 
+    else if (s[1] > LINE_THRESHOLD) {
+        // 7号触发：小幅右转修正
+        drive_motors(BASE_SPEED, SLOW_TURN);
+        lastDirection = 2;
     } 
     else if (s[0] > LINE_THRESHOLD) {
-        // 右边看到线：向右修正，记忆“最后在右边”
-        drive_motors(TURN_SPEED, SLOW_SPEED);
-        lastDirection = 2; 
-        Serial.println("TURN RIGHT");
+        // 9号触发：大幅右转 (应对 90 度弯)
+        drive_motors(FAST_TURN, INNER_WHEEL);
+        lastDirection = 2;
     } 
     else {
-        // --- 核心优化：丢失目标后的处理 ---
-        if (lastDirection == 1) {
-            // 最后一次是在左边丢的，说明黑线在更左边，原地左旋
-            drive_motors(-SCAN_SPEED, SCAN_SPEED); 
-            Serial.println("SEARCHING LEFT...");
-        } 
-        else if (lastDirection == 2) {
-            // 最后一次是在右边丢的，原地右旋
-            drive_motors(SCAN_SPEED, -SCAN_SPEED); 
-            Serial.println("SEARCHING RIGHT...");
-        } 
-        else {
-            // 如果之前一直是直行突然丢了，可能是到终点或意外，停止
-            drive_motors(0, 0);
-            Serial.println("TOTAL LOST - STOP");
-        }
+        // 丢失目标：原地自旋寻找
+        if (lastDirection == 1) drive_motors(-SCAN_SPEED, SCAN_SPEED);
+        else if (lastDirection == 2) drive_motors(SCAN_SPEED, -SCAN_SPEED);
+        else drive_motors(0, 0);
     }
 
-    delay(15);
+    delay(10); // 传感器多了，采样要更快
 }
+
+// ==========================================
+// 功能函数 (Read, Drive, Interrupt 保持不变)
+// ==========================================
 
 void handle_button_press() {
     unsigned long now = millis();
