@@ -1,3 +1,4 @@
+//C++ version
 #include <Arduino.h>
 #include <Wire.h>
 #include <Motoron.h>
@@ -90,4 +91,127 @@ void moveForward(int16_t speed) {
   mc.setSpeed(RIGHT_REAR,  speed);
   mc.setSpeed(LEFT_REAR,   speed);
   mc.setSpeed(LEFT_FRONT,  speed);
+}
+
+//C version
+#include <Arduino.h>
+#include <Wire.h>
+#include <Motoron.h>
+
+// --- 宏定义 (C 风格常量) ---
+#define LINE_THRESHOLD 500
+#define MOVE_SPEED 400
+#define NUM_SENSORS 3
+
+// --- 引脚定义 ---
+const int dataPins[NUM_SENSORS] = {10, 11, 12}; // 0:Right, 1:Medium, 2:Left
+
+// --- 电机通道定义 ---
+const uint8_t RF = 1; // Right Front
+const uint8_t RR = 2; // Right Rear
+const uint8_t LR = 3; // Left Rear
+const uint8_t LF = 4; // Left Front
+
+// 实例化驱动对象
+MotoronI2C mc;
+
+// --- 函数原型声明 (Function Prototypes) ---
+void init_robot(void);
+void read_sensors(unsigned long *durations);
+void set_vehicle_speed(int16_t speed);
+void stop_vehicle(void);
+
+// --- 主初始化函数 ---
+void setup() {
+    Serial.begin(115200);
+    init_robot();
+    Serial.println("System Initialized. Scanning for black line...");
+}
+
+// --- 主循环逻辑 ---
+void loop() {
+    unsigned long sensor_data[NUM_SENSORS];
+    
+    // 1. 获取传感器数值
+    read_sensors(sensor_data);
+    unsigned long medium_val = sensor_data[1];
+
+    // 2. 串口监控
+    Serial.print("L: "); Serial.print(sensor_data[2]);
+    Serial.print(" | M: "); Serial.print(medium_val);
+    Serial.print(" | R: "); Serial.println(sensor_data[0]);
+
+    // 3. 决策分支
+    if (medium_val > LINE_THRESHOLD) {
+        // 识别到黑线，执行前进
+        set_vehicle_speed(MOVE_SPEED);
+        Serial.println(">> TARGET ACQUIRED: FORWARD");
+    } else {
+        // 未识别到黑线，停止
+        stop_vehicle();
+        Serial.println(">> SEARCHING...");
+    }
+
+    delay(50); // 控制循环频率
+}
+
+// --- 具体功能实现 (Implementation) ---
+
+void init_robot(void) {
+    Wire1.begin();
+    mc.setBus(&Wire1);
+    mc.reinitialize();
+    mc.disableCrc();
+    mc.clearResetFlag();
+
+    // 配置四个电机的运动限制参数
+    for (uint8_t i = 1; i <= 4; i++) {
+        mc.setMaxAcceleration(i, 400);
+        mc.setMaxDeceleration(i, 600);
+    }
+    stop_vehicle();
+}
+
+/**
+ * 读取反射率传感器原始数据
+ * 使用 RC 放电计时原理
+ */
+void read_sensors(unsigned long *durations) {
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        int pin = dataPins[i];
+        
+        // 步骤1: 将引脚设为输出并拉高，给传感器电容充电
+        pinMode(pin, OUTPUT);
+        digitalWrite(pin, HIGH);
+        delayMicroseconds(10);
+        
+        // 步骤2: 切换为输入，测量电容通过光敏电阻放电的时间
+        pinMode(pin, INPUT);
+        unsigned long start_time = micros();
+        
+        // 步骤3: 等待放电完成或超时
+        while (digitalRead(pin) == HIGH && (micros() - start_time) < 3000);
+        
+        durations[i] = micros() - start_time;
+    }
+}
+
+/**
+ * 设置全车移动速度
+ */
+void set_vehicle_speed(int16_t speed) {
+    mc.setSpeed(RF, speed);
+    mc.setSpeed(RR, speed);
+    mc.setSpeed(LR, speed);
+    mc.setSpeed(LF, speed);
+}
+
+/**
+ * 紧急停止
+ */
+void stop_vehicle(void) {
+    mc.setSpeed(RF, 0);
+    mc.setSpeed(RR, 0);
+    mc.setSpeed(LR, 0);
+    mc.setSpeed(LF, 0);
 }
