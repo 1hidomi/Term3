@@ -1,0 +1,121 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Motoron.h>
+
+MotoronI2C mc;
+
+// 当前车轮布局
+const uint8_t RF = 1;  // M1 右前
+const uint8_t RR = 2;  // M2 右后
+const uint8_t LR = 3;  // M3 左后
+const uint8_t LF = 4;  // M4 左前
+
+// 电机方向修正
+// M4 左前反了，所以 DIR_LF = -1
+const int8_t DIR_RF = 1;
+const int8_t DIR_RR = 1;
+const int8_t DIR_LR = 1;
+const int8_t DIR_LF = -1;
+
+// 每个电机单独速度
+// M1 和 M3 卡住，所以给高一点
+const int16_t SPEED_RF = 1000;  // M1 右前
+const int16_t SPEED_RR = 1000;  // M2 右后
+const int16_t SPEED_LR = 1000;  // M3 左后
+const int16_t SPEED_LF = 1000;  // M4 左前
+
+// 转圈时间
+const unsigned long TURN_TIME_MS = 10000;
+
+unsigned long startTime = 0;
+bool finished = false;
+
+void stopAllMotors()
+{
+  mc.setSpeed(RF, 0);
+  mc.setSpeed(RR, 0);
+  mc.setSpeed(LR, 0);
+  mc.setSpeed(LF, 0);
+}
+
+void spinClockwise()
+{
+  // 原地顺时针转：
+  // 右侧轮子向后
+  // 左侧轮子向前
+
+  mc.setSpeed(RF, -SPEED_RF * DIR_RF);
+  mc.setSpeed(RR, -SPEED_RR * DIR_RR);
+
+  mc.setSpeed(LR,  SPEED_LR * DIR_LR);
+  mc.setSpeed(LF,  SPEED_LF * DIR_LF);
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
+
+  Wire1.begin();
+  mc.setBus(&Wire1);
+
+  mc.reinitialize();
+  mc.disableCrc();
+  mc.clearResetFlag();
+
+  // 加速度也提高一点，避免起步太软
+  mc.setMaxAcceleration(RF, 800);
+  mc.setMaxDeceleration(RF, 900);
+
+  mc.setMaxAcceleration(RR, 800);
+  mc.setMaxDeceleration(RR, 900);
+
+  mc.setMaxAcceleration(LR, 800);
+  mc.setMaxDeceleration(LR, 900);
+
+  mc.setMaxAcceleration(LF, 800);
+  mc.setMaxDeceleration(LF, 900);
+
+  stopAllMotors();
+
+  Serial.println("Spin clockwise test - higher speed");
+  Serial.println("M1 RF = 800");
+  Serial.println("M2 RR = 700");
+  Serial.println("M3 LR = 800");
+  Serial.println("M4 LF = 700, DIR_LF = -1");
+  Serial.println("2 seconds later start...");
+
+  delay(2000);
+
+  startTime = millis();
+}
+
+void loop()
+{
+  if (finished)
+  {
+    stopAllMotors();
+    delay(100);
+    return;
+  }
+
+  unsigned long elapsed = millis() - startTime;
+
+  if (elapsed < TURN_TIME_MS)
+  {
+    spinClockwise();
+
+    Serial.print("Spinning clockwise... ");
+    Serial.print(elapsed / 1000.0, 1);
+    Serial.println("s");
+  }
+  else
+  {
+    stopAllMotors();
+    finished = true;
+
+    Serial.println("Stop. Spin test finished.");
+  }
+
+  delay(100);
+}
