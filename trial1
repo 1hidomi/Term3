@@ -5,34 +5,62 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include "ICM_20948.h"
+///Users/admin/.platformio/penv/bin/platformio device monitor -e giga_r1_m7 --port /dev/cu.usbmodem101 --baud 115200
+
 
 const char WIFI_SSID[] = "hitomi";
 const char WIFI_PASSWORD[] = "Liu20061222";
 const uint16_t WIFI_KILL_PORT = 4210;
 
-// Motoron shield on SDA1/SCL1.
-MotoronI2C mc;
-const uint8_t RF = 1; // M1 right front
-const uint8_t RR = 2; // M2 right rear
-const uint8_t LR = 3; // M3 left rear
-const uint8_t LF = 4; // M4 left front
+const bool USE_IMU = true;
+const bool USE_WIFI_KILL = false;
+const bool USE_RFID = true;
+const bool STOP_AFTER_FORWARD_STEPS = false;
+const bool MOTOR_DIAGNOSTIC_MODE = false;
+const bool REFLECTANCE_DEBUG_MODE = true;
 
-const int8_t DIR_RF = -1;
-const int8_t DIR_RR = -1;
-const int8_t DIR_LR = 1;
-const int8_t DIR_LF = 1;
+// Dual Motoron shields on SDA1/SCL1.
+const uint8_t LOWER_MOTORON_ADDR = 0x10;
+const uint8_t UPPER_MOTORON_ADDR = 0x11;
 
-const int16_t FORWARD_SLOW_SPEED = 350;
-const int16_t FORWARD_FAST_SPEED = 800;
+MotoronI2C mcLower(LOWER_MOTORON_ADDR);
+MotoronI2C mcUpper(UPPER_MOTORON_ADDR);
+
+// Lower shield: RF/RR/LR on M1/M2/M3.
+// Upper shield: LF on M1.
+const uint8_t RF = 1;
+const uint8_t RR = 2;
+const uint8_t LR = 3;
+const uint8_t LF = 1;
+
+const int16_t MAX_MOTOR_SPEED = 1000;
+const int16_t MIN_MOTOR_RUN_SPEED = 600;
+
+// Encoder/digital wiring notes. These pins are not used by the current
+// forward-only motor test yet, but keep the confirmed wiring here.
+const uint8_t ENC_M3_C1_PIN = 5;
+const uint8_t ENC_M3_C2_PIN = 6;
+
+// Forward polarity per physical wheel.
+const int8_t FWD_RF = 1;
+const int8_t FWD_RR = 1;
+const int8_t FWD_LR = -1;
+const int8_t FWD_LF = -1;
+
+const int16_t FORWARD_SLOW_SPEED = 600;
+const int16_t FORWARD_FAST_SPEED = 1000;
+const int16_t MOTOR_TEST_SPEED = 700;
+const unsigned long MOTOR_TEST_STEP_MS = 1500;
 const int16_t PIVOT_FAST_SPEED = 650;
-const int16_t PIVOT_SLOW_SPEED = 380;
+const int16_t PIVOT_SLOW_SPEED = 600;
 const float PIVOT_SLOW_DOWN_DEG = 70.0;
 const float PIVOT_STOP_DEG = 88.0;
 
-const int16_t ARC_INNER_SPEED = 380;
-const int16_t ARC_OUTER_SPEED = 850;
-const int16_t ARC_INNER_SLOW_SPEED = 280;
-const int16_t ARC_OUTER_SLOW_SPEED = 600;
+// Right U-turn: right side is inner, left side is outer.
+const int16_t ARC_INNER_SPEED = 600;
+const int16_t ARC_OUTER_SPEED = 1000;
+const int16_t ARC_INNER_SLOW_SPEED = 600;
+const int16_t ARC_OUTER_SLOW_SPEED = 850;
 const float ARC_SLOW_DOWN_DEG = 150.0;
 const float ARC_STOP_DEG = 178.0;
 
@@ -44,13 +72,34 @@ float yawDeg = 0.0;
 unsigned long lastUpdateMicros = 0;
 
 // RFID WS1850S / MFRC522-compatible module on SDA1/SCL1.
-const uint8_t RFID_RESET_PIN = 9;
-MFRC522_I2C mfrc522(0x28, RFID_RESET_PIN, &Wire1);
+// This module only has VCC/GND/SDA/SCL, so RFID init uses software reset only.
+const uint8_t RFID_I2C_ADDR = 0x28;
+const uint8_t RFID_UNUSED_RESET_PIN = 0xFF;
+MFRC522_I2C mfrc522(RFID_I2C_ADDR, RFID_UNUSED_RESET_PIN, &Wire1);
+bool rfidReady = false;
 
 const uint8_t NUM_REFLECTANCE = 5;
-const uint8_t reflectancePins[NUM_REFLECTANCE] = {10, 30, 11, 28, 12};
+const uint8_t QTR_OUT_1_PIN = 22;
+const uint8_t QTR_OUT_3_PIN = 24;
+const uint8_t QTR_OUT_5_PIN = 26;
+const uint8_t QTR_OUT_7_PIN = 28;
+const uint8_t QTR_OUT_9_PIN = 30;
+const uint8_t reflectancePins[NUM_REFLECTANCE] = {
+    QTR_OUT_1_PIN,
+    QTR_OUT_3_PIN,
+    QTR_OUT_5_PIN,
+    QTR_OUT_7_PIN,
+    QTR_OUT_9_PIN,
+};
 const uint32_t REFLECTANCE_TIMEOUT_US = 3000;
 uint32_t reflectanceValues[NUM_REFLECTANCE] = {0, 0, 0, 0, 0};
+
+const uint8_t US_FRONT_ECHO_PIN = 37;
+const uint8_t US_FRONT_TRIG_PIN = 39;
+const uint8_t US_LEFT_ECHO_PIN = 52;
+const uint8_t US_LEFT_TRIG_PIN = 44;
+const uint8_t US_RIGHT_ECHO_PIN = 46;
+const uint8_t US_RIGHT_TRIG_PIN = 48;
 
 struct UltrasonicSensor {
   const char *name;
@@ -60,12 +109,14 @@ struct UltrasonicSensor {
 };
 
 UltrasonicSensor ultrasonicSensors[] = {
-    {"Front", 39, 37, -1.0},
-    {"Left", 44, 42, -1.0},
-    {"Right", 22, 24, -1.0},
+    {"Front", US_FRONT_TRIG_PIN, US_FRONT_ECHO_PIN, -1.0},
+    {"Left", US_LEFT_TRIG_PIN, US_LEFT_ECHO_PIN, -1.0},
+    {"Right", US_RIGHT_TRIG_PIN, US_RIGHT_ECHO_PIN, -1.0},
 };
 const uint8_t NUM_ULTRASONIC = sizeof(ultrasonicSensors) / sizeof(ultrasonicSensors[0]);
 const uint32_t ULTRASONIC_TIMEOUT_US = 25000;
+const unsigned long ULTRASONIC_SENSOR_GAP_MS = 60;
+uint8_t nextUltrasonicIndex = 0;
 
 const uint8_t REVIVE_BUTTON_PIN = 32;
 const uint8_t KILL_BUTTON_PIN = 45;
@@ -86,6 +137,7 @@ DebouncedButton killButton = {KILL_BUTTON_PIN, HIGH, HIGH, 0};
 
 bool isRevived = false;
 bool killStopped = false;
+bool redBlinkEnabled = false;
 unsigned long killPauseStartMs = 0;
 unsigned long lastBlinkMs = 0;
 bool blinkRedOn = false;
@@ -108,48 +160,67 @@ unsigned long stateStartMs = 0;
 float stateStartYawDeg = 0.0;
 unsigned long lastSensorPrintMs = 0;
 unsigned long lastUltrasonicReadMs = 0;
+unsigned long lastRFIDRetryMs = 0;
+unsigned long lastRFIDCheckMs = 0;
+const unsigned long SENSOR_STATUS_INTERVAL_MS = 1000;
+const unsigned long RFID_RETRY_INTERVAL_MS = 1000;
+const unsigned long RFID_CHECK_INTERVAL_MS = 80;
+
+int16_t normalizeMotorSpeed(int16_t speed) {
+  if (speed == 0) {
+    return 0;
+  }
+
+  speed = constrain(speed, -MAX_MOTOR_SPEED, MAX_MOTOR_SPEED);
+
+  if (speed > 0 && speed < MIN_MOTOR_RUN_SPEED) {
+    return MIN_MOTOR_RUN_SPEED;
+  }
+
+  if (speed < 0 && speed > -MIN_MOTOR_RUN_SPEED) {
+    return -MIN_MOTOR_RUN_SPEED;
+  }
+
+  return speed;
+}
 
 void setMotorSpeeds(int16_t rf, int16_t rr, int16_t lr, int16_t lf) {
-  mc.setSpeed(RF, rf);
-  mc.setSpeed(RR, rr);
-  mc.setSpeed(LR, lr);
-  mc.setSpeed(LF, lf);
+  mcLower.setSpeed(RF, normalizeMotorSpeed(rf));
+  mcLower.setSpeed(RR, normalizeMotorSpeed(rr));
+  mcLower.setSpeed(LR, normalizeMotorSpeed(lr));
+  mcUpper.setSpeed(LF, normalizeMotorSpeed(lf));
 }
 
 void stopAllMotors() {
   setMotorSpeeds(0, 0, 0, 0);
 }
 
-void driveForward(int16_t speed) {
+void driveBySide(int16_t leftSpeed, int16_t rightSpeed) {
+  leftSpeed = constrain(leftSpeed, -MAX_MOTOR_SPEED, MAX_MOTOR_SPEED);
+  rightSpeed = constrain(rightSpeed, -MAX_MOTOR_SPEED, MAX_MOTOR_SPEED);
+
   setMotorSpeeds(
-      speed * DIR_RF,
-      speed * DIR_RR,
-      speed * DIR_LR,
-      speed * DIR_LF);
+      rightSpeed * FWD_RF,
+      rightSpeed * FWD_RR,
+      leftSpeed * FWD_LR,
+      leftSpeed * FWD_LF);
+}
+
+void driveForward(int16_t speed) {
+  driveBySide(speed, speed);
 }
 
 void pivotClockwise(int16_t speed) {
-  setMotorSpeeds(
-      -speed * DIR_RF,
-      -speed * DIR_RR,
-      speed * DIR_LR,
-      speed * DIR_LF);
+  driveBySide(speed, -speed);
 }
 
 void pivotCounterClockwise(int16_t speed) {
-  setMotorSpeeds(
-      speed * DIR_RF,
-      speed * DIR_RR,
-      -speed * DIR_LR,
-      -speed * DIR_LF);
+  driveBySide(-speed, speed);
 }
 
-void driveClockwiseArc(int16_t innerSpeed, int16_t outerSpeed) {
-  setMotorSpeeds(
-      innerSpeed * DIR_RF,
-      innerSpeed * DIR_RR,
-      outerSpeed * DIR_LR,
-      outerSpeed * DIR_LF);
+void driveRightUArc(int16_t innerSpeed, int16_t outerSpeed) {
+  // Right U-turn: left side goes faster, right side goes slower.
+  driveBySide(outerSpeed, innerSpeed);
 }
 
 const char *stateName(RobotState state) {
@@ -158,7 +229,7 @@ const char *stateName(RobotState state) {
     case FAST_FORWARD: return "FAST_FORWARD";
     case TURN_CCW_90: return "TURN_CCW_90";
     case TURN_CW_90: return "TURN_CW_90";
-    case UTURN: return "UTURN";
+    case UTURN: return "RIGHT_UTURN";
     case DONE: return "DONE";
   }
   return "UNKNOWN";
@@ -200,7 +271,7 @@ bool buttonPressed(DebouncedButton &button) {
 }
 
 void updateLed() {
-  if (killStopped) {
+  if (redBlinkEnabled) {
     if (millis() - lastBlinkMs >= KILL_BLINK_MS) {
       lastBlinkMs = millis();
       blinkRedOn = !blinkRedOn;
@@ -227,15 +298,27 @@ void setKillStopped(bool stopped, const char *source) {
   Serial.println(killStopped ? F("STOP") : F("CONTINUE"));
 
   if (killStopped) {
+    isRevived = false;
+    redBlinkEnabled = true;
     killPauseStartMs = millis();
     blinkRedOn = true;
     lastBlinkMs = millis();
     stopAllMotors();
   } else {
+    redBlinkEnabled = false;
     unsigned long pausedMs = millis() - killPauseStartMs;
     stateStartMs += pausedMs;
     lastUpdateMicros = micros();
   }
+}
+
+void setReviveLedGreen(const char *source) {
+  isRevived = true;
+  redBlinkEnabled = false;
+
+  Serial.print(F("REVIVE | "));
+  Serial.print(source);
+  Serial.println(F(" -> LED GREEN"));
 }
 
 void scanI2CBus(TwoWire &bus, const char *name) {
@@ -311,6 +394,10 @@ void calibrateGyroZ() {
 }
 
 void updateYaw() {
+  if (!USE_IMU) {
+    return;
+  }
+
   if (!imu.dataReady()) {
     return;
   }
@@ -368,14 +455,13 @@ float readUltrasonicCm(UltrasonicSensor &sensor) {
 }
 
 void updateUltrasonic() {
-  if (millis() - lastUltrasonicReadMs < 200) {
+  if (millis() - lastUltrasonicReadMs < ULTRASONIC_SENSOR_GAP_MS) {
     return;
   }
 
   lastUltrasonicReadMs = millis();
-  for (uint8_t i = 0; i < NUM_ULTRASONIC; i++) {
-    ultrasonicSensors[i].distanceCm = readUltrasonicCm(ultrasonicSensors[i]);
-  }
+  ultrasonicSensors[nextUltrasonicIndex].distanceCm = readUltrasonicCm(ultrasonicSensors[nextUltrasonicIndex]);
+  nextUltrasonicIndex = (nextUltrasonicIndex + 1) % NUM_ULTRASONIC;
 }
 
 void printDistance(float distanceCm) {
@@ -387,21 +473,21 @@ void printDistance(float distanceCm) {
 }
 
 void printSensorStatus() {
-  if (millis() - lastSensorPrintMs < 200) {
+  if (millis() - lastSensorPrintMs < SENSOR_STATUS_INTERVAL_MS) {
     return;
   }
 
   lastSensorPrintMs = millis();
 
-  Serial.print(F("SENS | IR L(D12)="));
+  Serial.print(F("SENS | IR L(D30)="));
   Serial.print(reflectanceValues[4]);
-  Serial.print(F("D28="));
+  Serial.print(F(" D28="));
   Serial.print(reflectanceValues[3]);
-  Serial.print(F("M(D11)="));
+  Serial.print(F(" M(D26)="));
   Serial.print(reflectanceValues[2]);
-  Serial.print(F("D30="));
+  Serial.print(F(" D24="));
   Serial.print(reflectanceValues[1]);
-  Serial.print(F("R(D10)="));
+  Serial.print(F(" R(D22)="));
   Serial.print(reflectanceValues[0]);
 
   Serial.print(F(" | US Front="));
@@ -411,22 +497,56 @@ void printSensorStatus() {
   Serial.print(F("cm Right="));
   printDistance(ultrasonicSensors[2].distanceCm);
   Serial.print(F("cm | Yaw="));
-  Serial.print(yawDeg, 1);
+  if (USE_IMU) {
+    Serial.print(yawDeg, 1);
+  } else {
+    Serial.print(F("OFF"));
+  }
   Serial.print(F(" | State="));
   Serial.print(stateName(robotState));
   Serial.print(F(" | Kill="));
-  Serial.println(killStopped ? F("STOP") : F("RUN"));
+  Serial.print(killStopped ? F("STOP") : F("RUN"));
+  Serial.print(F(" | Revive="));
+  Serial.print(isRevived ? F("YES") : F("NO"));
+  Serial.print(F(" | Blink="));
+  Serial.print(redBlinkEnabled ? F("YES") : F("NO"));
+  Serial.print(F(" | RFID="));
+  if (USE_RFID) {
+    Serial.println(rfidReady ? F("READY") : F("NO"));
+  } else {
+    Serial.println(F("OFF"));
+  }
 }
 
+bool initRFIDNoResetPin();
+
 void updateRFID() {
+  if (!USE_RFID) {
+    return;
+  }
+
+  if (!rfidReady) {
+    if (millis() - lastRFIDRetryMs >= RFID_RETRY_INTERVAL_MS) {
+      lastRFIDRetryMs = millis();
+      rfidReady = initRFIDNoResetPin();
+    }
+    return;
+  }
+
+  if (millis() - lastRFIDCheckMs < RFID_CHECK_INTERVAL_MS) {
+    return;
+  }
+  lastRFIDCheckMs = millis();
+
   if (!mfrc522.PICC_IsNewCardPresent()) {
     return;
   }
+
   if (!mfrc522.PICC_ReadCardSerial()) {
     return;
   }
 
-  Serial.print(F("RFID | Found ID:"));
+  Serial.print(F("RFID | Card ID:"));
   for (byte i = 0; i < mfrc522.uid.size; i++) {
     Serial.print(mfrc522.uid.uidByte[i] < 0x10 ? F(" 0") : F(" "));
     Serial.print(mfrc522.uid.uidByte[i], HEX);
@@ -434,6 +554,38 @@ void updateRFID() {
   Serial.println();
 
   mfrc522.PICC_HaltA();
+}
+
+bool initRFIDNoResetPin() {
+  Wire1.beginTransmission(RFID_I2C_ADDR);
+  if (Wire1.endTransmission() != 0) {
+    Serial.println(F("RFID | Not found at I2C address 0x28."));
+    return false;
+  }
+
+  // Same core setup as MFRC522_I2C::PCD_Init(), but without touching a reset pin.
+  mfrc522.PCD_Reset();
+  mfrc522.PCD_WriteRegister(MFRC522_I2C::TModeReg, 0x80);
+  mfrc522.PCD_WriteRegister(MFRC522_I2C::TPrescalerReg, 0xA9);
+  mfrc522.PCD_WriteRegister(MFRC522_I2C::TReloadRegH, 0x03);
+  mfrc522.PCD_WriteRegister(MFRC522_I2C::TReloadRegL, 0xE8);
+  mfrc522.PCD_WriteRegister(MFRC522_I2C::TxASKReg, 0x40);
+  mfrc522.PCD_WriteRegister(MFRC522_I2C::ModeReg, 0x3D);
+  mfrc522.PCD_AntennaOn();
+
+  byte version = mfrc522.PCD_ReadRegister(MFRC522_I2C::VersionReg);
+  Serial.print(F("RFID | Ready at 0x28, version register=0x"));
+  if (version < 0x10) {
+    Serial.print(F("0"));
+  }
+  Serial.println(version, HEX);
+
+  if (version == 0x00 || version == 0xFF) {
+    Serial.println(F("RFID | Version read failed. Check SDA1/SCL1, VCC, GND, and I2C address."));
+    return false;
+  }
+
+  return true;
 }
 
 void beginWiFiKillSwitch() {
@@ -471,6 +623,10 @@ void handleWifiCommand(String command) {
 }
 
 void updateWiFiKillSwitch() {
+  if (!USE_WIFI_KILL) {
+    return;
+  }
+
   if (WiFi.status() != WL_CONNECTED) {
     udpStarted = false;
     if (millis() - lastWiFiAttemptMs > 10000) {
@@ -504,14 +660,78 @@ void updateWiFiKillSwitch() {
 }
 
 void updateButtons() {
+  if (digitalRead(REVIVE_BUTTON_PIN) == LOW) {
+    setReviveLedGreen("D32 level");
+  }
+
   if (buttonPressed(reviveButton)) {
-    isRevived = !isRevived;
-    Serial.print(F("REVIVE | LED state -> "));
-    Serial.println(isRevived ? F("GREEN") : F("RED"));
+    setReviveLedGreen("D32");
   }
 
   if (buttonPressed(killButton)) {
     setKillStopped(!killStopped, "Mechanical");
+  }
+}
+
+void setupMotoron(MotoronI2C &mc, uint8_t m1, uint8_t m2 = 0, uint8_t m3 = 0) {
+  mc.setBus(&Wire1);
+  mc.reinitialize();
+  mc.disableCrc();
+  mc.clearResetFlag();
+
+  mc.setMaxAcceleration(m1, 800);
+  mc.setMaxDeceleration(m1, 900);
+
+  if (m2 != 0) {
+    mc.setMaxAcceleration(m2, 800);
+    mc.setMaxDeceleration(m2, 900);
+  }
+
+  if (m3 != 0) {
+    mc.setMaxAcceleration(m3, 800);
+    mc.setMaxDeceleration(m3, 900);
+  }
+}
+
+void runMotorDiagnostic() {
+  static int lastPhase = -1;
+  uint8_t phase = (millis() / MOTOR_TEST_STEP_MS) % 16;
+
+  if ((int)phase != lastPhase) {
+    lastPhase = phase;
+
+    switch (phase) {
+      case 0: Serial.println(F("MOTOR_TEST | Lower M1 RF +")); break;
+      case 1: Serial.println(F("MOTOR_TEST | STOP")); break;
+      case 2: Serial.println(F("MOTOR_TEST | Lower M1 RF -")); break;
+      case 3: Serial.println(F("MOTOR_TEST | STOP")); break;
+      case 4: Serial.println(F("MOTOR_TEST | Lower M2 RR +")); break;
+      case 5: Serial.println(F("MOTOR_TEST | STOP")); break;
+      case 6: Serial.println(F("MOTOR_TEST | Lower M2 RR -")); break;
+      case 7: Serial.println(F("MOTOR_TEST | STOP")); break;
+      case 8: Serial.println(F("MOTOR_TEST | Lower M3 LR +")); break;
+      case 9: Serial.println(F("MOTOR_TEST | STOP")); break;
+      case 10: Serial.println(F("MOTOR_TEST | Lower M3 LR -")); break;
+      case 11: Serial.println(F("MOTOR_TEST | STOP")); break;
+      case 12: Serial.println(F("MOTOR_TEST | Upper M1 LF +")); break;
+      case 13: Serial.println(F("MOTOR_TEST | STOP")); break;
+      case 14: Serial.println(F("MOTOR_TEST | Upper M1 LF -")); break;
+      case 15: Serial.println(F("MOTOR_TEST | STOP")); break;
+    }
+  }
+
+  stopAllMotors();
+
+  switch (phase) {
+    case 0: setMotorSpeeds(MOTOR_TEST_SPEED, 0, 0, 0); break;
+    case 2: setMotorSpeeds(-MOTOR_TEST_SPEED, 0, 0, 0); break;
+    case 4: setMotorSpeeds(0, MOTOR_TEST_SPEED, 0, 0); break;
+    case 6: setMotorSpeeds(0, -MOTOR_TEST_SPEED, 0, 0); break;
+    case 8: setMotorSpeeds(0, 0, MOTOR_TEST_SPEED, 0); break;
+    case 10: setMotorSpeeds(0, 0, -MOTOR_TEST_SPEED, 0); break;
+    case 12: setMotorSpeeds(0, 0, 0, MOTOR_TEST_SPEED); break;
+    case 14: setMotorSpeeds(0, 0, 0, -MOTOR_TEST_SPEED); break;
+    default: stopAllMotors(); break;
   }
 }
 
@@ -534,7 +754,7 @@ void runMovement() {
       if (millis() - stateStartMs < 3000) {
         driveForward(FORWARD_FAST_SPEED);
       } else {
-        enterState(TURN_CCW_90);
+        enterState(STOP_AFTER_FORWARD_STEPS ? DONE : TURN_CCW_90);
       }
       break;
 
@@ -562,9 +782,9 @@ void runMovement() {
       float arcDeg = fabs(yawDeg - stateStartYawDeg);
       if (arcDeg < ARC_STOP_DEG) {
         if (arcDeg < ARC_SLOW_DOWN_DEG) {
-          driveClockwiseArc(ARC_INNER_SPEED, ARC_OUTER_SPEED);
+          driveRightUArc(ARC_INNER_SPEED, ARC_OUTER_SPEED);
         } else {
-          driveClockwiseArc(ARC_INNER_SLOW_SPEED, ARC_OUTER_SLOW_SPEED);
+          driveRightUArc(ARC_INNER_SLOW_SPEED, ARC_OUTER_SLOW_SPEED);
         }
       } else {
         enterState(DONE);
@@ -596,56 +816,88 @@ void setup() {
     digitalWrite(ultrasonicSensors[i].trigPin, LOW);
   }
 
-  Wire.begin();
-  Wire.setClock(400000);
-  scanI2CBus(Wire, "Wire IMU bus");
+  if (USE_IMU) {
+    Wire.begin();
+    Wire.setClock(400000);
+    scanI2CBus(Wire, "Wire IMU bus");
 
-  while (!initIMU()) {
-    Serial.println(F("IMU | Not ready, retrying..."));
-    delay(500);
+    while (!initIMU()) {
+      Serial.println(F("IMU | Not ready, retrying..."));
+      delay(500);
+    }
   }
 
   Wire1.begin();
   Wire1.setClock(400000);
   scanI2CBus(Wire1, "Wire1 Motoron/RFID bus");
 
-  mc.setBus(&Wire1);
-  mc.reinitialize();
-  mc.disableCrc();
-  mc.clearResetFlag();
-  mc.setMaxAcceleration(RF, 800);
-  mc.setMaxDeceleration(RF, 900);
-  mc.setMaxAcceleration(RR, 800);
-  mc.setMaxDeceleration(RR, 900);
-  mc.setMaxAcceleration(LR, 800);
-  mc.setMaxDeceleration(LR, 900);
-  mc.setMaxAcceleration(LF, 800);
-  mc.setMaxDeceleration(LF, 900);
+  setupMotoron(mcLower, RF, RR, LR);
+  setupMotoron(mcUpper, LF);
   stopAllMotors();
 
-  mfrc522.PCD_Init();
-  Serial.println(F("RFID | Ready"));
+  if (USE_RFID) {
+    rfidReady = initRFIDNoResetPin();
+  }
 
-  beginWiFiKillSwitch();
+  if (killButton.stableState == LOW) {
+    setKillStopped(true, "Mechanical boot");
+  }
 
-  Serial.println(F("ROBOT | Keep car still for gyro calibration"));
-  delay(1000);
-  calibrateGyroZ();
+  Serial.println(F("ROBOT | Dual Motoron ready: lower=0x10 RF/RR/LR, upper=0x11 LF."));
+  Serial.println(USE_RFID ? F("RFID | Enabled on SDA1/SCL1, address 0x28.") : F("RFID | Disabled for trial run."));
+  Serial.println(F("REVIVE | Wire D32 -> switch -> GND. D32 controls LED only."));
 
-  yawDeg = 0.0;
-  lastUpdateMicros = micros();
+  if (USE_WIFI_KILL) {
+    beginWiFiKillSwitch();
+  } else {
+    Serial.println(F("WIFI | Kill switch disabled. D45 mechanical kill controls movement."));
+  }
+
+  if (USE_IMU) {
+    Serial.println(F("ROBOT | Keep car still for gyro calibration"));
+    delay(1000);
+    calibrateGyroZ();
+
+    yawDeg = 0.0;
+    lastUpdateMicros = micros();
+  } else {
+    Serial.println(F("IMU | Disabled for forward-only test."));
+  }
+
+  if (STOP_AFTER_FORWARD_STEPS) {
+    Serial.println(F("ROBOT | Test sequence: SLOW_FORWARD then FAST_FORWARD then DONE."));
+  }
+
+  if (MOTOR_DIAGNOSTIC_MODE) {
+    Serial.println(F("ROBOT | MOTOR_DIAGNOSTIC_MODE enabled. One motor will run at a time."));
+  }
+
   enterState(SLOW_FORWARD);
+  stopAllMotors();
+  Serial.println(F("ROBOT | D45 toggles movement stop/run. D32 toggles LED only."));
 }
 
 void loop() {
-  updateYaw();
   updateButtons();
   updateLed();
+
+  if (MOTOR_DIAGNOSTIC_MODE) {
+    if (killStopped) {
+      stopAllMotors();
+    } else {
+      runMotorDiagnostic();
+    }
+    delay(5);
+    return;
+  }
+
+  updateYaw();
   updateWiFiKillSwitch();
   updateRFID();
   updateReflectance();
   updateUltrasonic();
   printSensorStatus();
+
   runMovement();
   delay(5);
 }
