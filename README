@@ -1,1 +1,85 @@
+1. Repository Structure
 
+   ├── final.ino                   # Main Arduino deployment script
+   │   └── secrets.h               # Network and MQTT credentials configuration
+   │   README.md                   # Setup and documentation manual
+   │   software_overview_diagram
+   │   flowcharts
+   └── calibration_evidence
+
+2. Required Libraries
+
+Before compiling the code, open Arduino IDE Library Manager and install the following dependencies:
+· MiniMessenger – Official challenge communication library.
+· ArduinoMqttClient – Core dependency required by MiniMessenger.
+· Motoron – Official Pololu library for controlling the N20 dual motor shields.
+· ICM_20948 – SparkFun library for handling the 9-DOF IMU gyroscope tracking.
+· MFRC522_I2C – Library for reading grid checkpoint RFID cards over the I2C bus.
+· Servo – Standard Arduino library utilized to manipulate the 360° continuous rotation micro servo.
+· Wire & Arduino – Built-in core frameworks for standard I2C communication and GIGA mappings.
+
+3. Setup Steps
+
+Step 1: Configure Your Secrets File
+Create a new tab in your Arduino IDE named secrets.h inside the final_robot_run sketch folder. Copy and paste the specific lab network credentials below:
+#define WIFI_SSID "PhaseSpaceNetwork_2.4G"
+#define WIFI_PASSWORD "8igMacNet"
+#define BROKER_HOST "192.168.0.74"       
+#define BROKER_PORT 1883
+#define GROUP_ID "5"             
+
+Step 2: Hardware Interfacing Checklist
+Ensure all the onboard modules are correctly pinned out to the Arduino GIGA:
+Motoron shields
+• I2C SDA → SDA1
+• I2C SCL → SCL1
+• Lower Motoron address: 0x10
+• Upper Motoron address: 0x11
+• Lower Motoron M1 → RF motor
+• Lower Motoron M2 → RR motor
+• Lower Motoron M3 → LR motor
+• Upper Motoron M1 → LF motor
+RFID Sensor
+• 5V → 5V
+• GND → GND
+• SDA → SDA1
+• SCL → SCL1
+• I2C address: 0x28
+Reflectance Sensor Array
+• VCC → 3.3V
+• GND → GND
+• Out 1 → D22
+• Out 3 → D24
+• Out 5 → D26
+• Out 7 → D28
+• Out 9 → D31
+Ultrasonic Sensors
+• VCC → 5V
+• GND → GND
+• Front Echo → D37, Trig → D39
+• Left Echo → D52, Trig → D44
+• Right Echo → D46, Trig → D48
+Revive Button
+• One side → GND
+• Other side → D32
+Mechanical Kill Switch Button
+• One side → GND
+• Other side → D45
+Servo Motor
+• Signal → D7
+• VCC → 5V
+• GND → GND
+
+4. How to Upload and Run the Code
+
+Uploading to the Board
+· Connect the Arduino GIGA R1 WiFi to your computer using a reliable USB-C cable.
+· In the Arduino IDE, go to Tools -> Board and select Arduino Mbed OS GIGA Boards -> Arduino GIGA R1.
+· Go to Tools -> Port and select the active COM port assigned to your GIGA.
+· Click the Verify checkmark button to compile, then click Upload to flash the code to Thomas.
+
+Running and Testing the Kill Switch
+· Once uploaded, open the Serial Monitor at 115200 baud to monitor the connection status.
+· Connect your laptop or debugging device to the same lab network (SSID: PhaseSpaceNetwork_2.4G).
+· Open a web browser and navigate to team's live command dashboard: http://192.168.0.74:8090/team/5
+· Use the interface's Enable/Disable buttons to trigger the safety stop. The messenger.loop() function running continuously inside our main loop will intercept the emergency payload, execute stopAllMotors(), and immediately kill power to the wheels if safe operation thresholds are breached.
