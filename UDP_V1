@@ -79,16 +79,15 @@ lib_deps =
 // Current test changes: fixed route, first left 90, then right 90 at intersection.
 // Find-line swing order after turns is reversed from the previous test.
 /*
+HELP
 STATUS
 PARAMS
-SET forward_speed 700
-SET obstacle_estop_cm 10
-FWD 2000 600
-LEFT90
-RIGHT90
-UTURN
-LINE ON
+GET line_threshold
+SET line_threshold 810
+SET forward_speed 850
+SET right_angle_target_deg 88
 STOP
+RUN
 */
 #include <Arduino.h>
 #include <math.h>
