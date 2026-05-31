@@ -54,8 +54,8 @@ const unsigned long STALL_CHECK_MS = 500;
 
 // Encoder order: RF, RR, LR, LF.
 const uint8_t NUM_ENCODERS = 4;
-const uint8_t ENC_A[NUM_ENCODERS] = {2, 4, 6, 8};
-const uint8_t ENC_B[NUM_ENCODERS] = {3, 5, 7, 9};
+const uint8_t ENC_A[NUM_ENCODERS] = {18, 2, 4, 8};
+const uint8_t ENC_B[NUM_ENCODERS] = {19, 3, 5, 9};
 long encoderCounts[NUM_ENCODERS] = {0, 0, 0, 0};
 long lastLoggedCounts[NUM_ENCODERS] = {0, 0, 0, 0};
 long lastStallCounts[NUM_ENCODERS] = {0, 0, 0, 0};
