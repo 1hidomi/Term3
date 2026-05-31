@@ -1,0 +1,685 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Motoron.h>
+#include "ICM_20948.h"
+
+// IMU + ENCODER LEFT 90 TEST
+// IMU controls the final angle. Encoders are logged for calibration and stall checks.
+// If encoder readings become reliable, use the printed summary to add an encoder stop target.
+
+const uint8_t LOWER_MOTORON_ADDR = 0x11;
+const uint8_t UPPER_MOTORON_ADDR = 0x10;
+
+MotoronI2C mcLower(LOWER_MOTORON_ADDR);
+MotoronI2C mcUpper(UPPER_MOTORON_ADDR);
+
+// Lower shield: RF/RR/LR on M1/M2/M3.
+// Upper shield: LF on M1.
+const uint8_t RF = 1;
+const uint8_t RR = 2;
+const uint8_t LR = 3;
+const uint8_t LF = 1;
+
+// Confirmed forward polarity.
+const int8_t FWD_RF = -1;
+const int8_t FWD_RR = 1;
+const int8_t FWD_LR = -1;
+const int8_t FWD_LF = -1;
+
+const int16_t MOTOR_CMD_MAX_SPEED = 800;
+const int16_t TURN_FAST_SPEED = 800;
+const int16_t TURN_MID_SPEED = 720;
+const int16_t TURN_FINE_SPEED = 620;
+const uint8_t RIGHT_PIVOT_RF_PERCENT = 100;
+const uint8_t RIGHT_PIVOT_RR_PERCENT = 100;
+const uint8_t RIGHT_PIVOT_LR_PERCENT = 100;
+const uint8_t RIGHT_PIVOT_LF_PERCENT = 100;
+const uint8_t LEFT_PIVOT_RF_PERCENT = 100;
+const uint8_t LEFT_PIVOT_RR_PERCENT = 100;
+const uint8_t LEFT_PIVOT_LR_PERCENT = 100;
+const uint8_t LEFT_PIVOT_LF_PERCENT = 100;
+const float TURN_TARGET_DEG = 90.0;
+const float TURN_TOLERANCE_DEG = 1.5;
+const float TURN_MID_REMAINING_DEG = 28.0;
+const float TURN_FINE_REMAINING_DEG = 9.0;
+const float TURN_SEGMENT_DEG = 12.0;
+const int16_t RELIEF_SPEED = 620;
+const unsigned long RELIEF_PULSE_MS = 80;
+const unsigned long SEGMENT_STOP_MS = 70;
+const unsigned long START_DELAY_MS = 2500;
+const unsigned long TURN_TIMEOUT_MS = 14000;
+const unsigned long SETTLE_MS = 180;
+const unsigned long STATUS_INTERVAL_MS = 100;
+const unsigned long STALL_CHECK_MS = 500;
+
+// Encoder order: RF, RR, LR, LF.
+const uint8_t NUM_ENCODERS = 4;
+const uint8_t ENC_A[NUM_ENCODERS] = {2, 4, 6, 8};
+const uint8_t ENC_B[NUM_ENCODERS] = {3, 5, 7, 9};
+long encoderCounts[NUM_ENCODERS] = {0, 0, 0, 0};
+long lastLoggedCounts[NUM_ENCODERS] = {0, 0, 0, 0};
+long lastStallCounts[NUM_ENCODERS] = {0, 0, 0, 0};
+bool lastEncoderA[NUM_ENCODERS] = {HIGH, HIGH, HIGH, HIGH};
+
+ICM_20948_I2C imu;
+bool imuAd0Val = false;
+float gyroZBias = 0.0;
+float yawDeg = 0.0;
+float startYawDeg = 0.0;
+float lastStallYawDeg = 0.0;
+float segmentTargetDeg = 0.0;
+unsigned long lastUpdateMicros = 0;
+unsigned long stateStartMs = 0;
+unsigned long turnStartMs = 0;
+unsigned long lastStatusMs = 0;
+unsigned long lastStallCheckMs = 0;
+bool nextReliefForward = true;
+
+enum TurnState {
+  WAITING_TO_START,
+  TURN_LEFT_APPROACH,
+  SEGMENT_STOP,
+  RELIEF_FORWARD,
+  RELIEF_BACKWARD,
+  SETTLE_AFTER_APPROACH,
+  FINE_CORRECT_RIGHT,
+  FINE_CORRECT_LEFT,
+  DONE
+};
+
+TurnState turnState = WAITING_TO_START;
+
+const char *stateName(TurnState state)
+{
+  switch (state) {
+    case WAITING_TO_START: return "WAITING";
+    case TURN_LEFT_APPROACH: return "TURN_LEFT_APPROACH";
+    case SEGMENT_STOP: return "SEGMENT_STOP";
+    case RELIEF_FORWARD: return "RELIEF_FORWARD";
+    case RELIEF_BACKWARD: return "RELIEF_BACKWARD";
+    case SETTLE_AFTER_APPROACH: return "SETTLE";
+    case FINE_CORRECT_RIGHT: return "FINE_RIGHT";
+    case FINE_CORRECT_LEFT: return "FINE_LEFT";
+    case DONE: return "DONE";
+  }
+  return "UNKNOWN";
+}
+
+int16_t clampMotorSpeed(int16_t speed)
+{
+  return constrain(speed, -MOTOR_CMD_MAX_SPEED, MOTOR_CMD_MAX_SPEED);
+}
+
+void setMotorSpeeds(int16_t rf, int16_t rr, int16_t lr, int16_t lf)
+{
+  mcLower.setSpeed(RF, clampMotorSpeed(rf));
+  mcLower.setSpeed(RR, clampMotorSpeed(rr));
+  mcLower.setSpeed(LR, clampMotorSpeed(lr));
+  mcUpper.setSpeed(LF, clampMotorSpeed(lf));
+}
+
+void stopAllMotors()
+{
+  setMotorSpeeds(0, 0, 0, 0);
+}
+
+void driveBySide(int16_t leftSpeed, int16_t rightSpeed)
+{
+  setMotorSpeeds(
+      rightSpeed * FWD_RF,
+      rightSpeed * FWD_RR,
+      leftSpeed * FWD_LR,
+      leftSpeed * FWD_LF);
+}
+
+void driveStraight(int16_t speed)
+{
+  driveBySide(speed, speed);
+}
+
+int16_t scaledSpeed(int16_t speed, uint8_t percent)
+{
+  long scaled = (long)speed * percent / 100;
+  return (int16_t)scaled;
+}
+
+void pivotRight(int16_t speed)
+{
+  // Right pivot: left side forward, right side backward.
+  setMotorSpeeds(
+      scaledSpeed(-speed, RIGHT_PIVOT_RF_PERCENT) * FWD_RF,
+      scaledSpeed(-speed, RIGHT_PIVOT_RR_PERCENT) * FWD_RR,
+      scaledSpeed(speed, RIGHT_PIVOT_LR_PERCENT) * FWD_LR,
+      scaledSpeed(speed, RIGHT_PIVOT_LF_PERCENT) * FWD_LF);
+}
+
+void pivotLeft(int16_t speed)
+{
+  setMotorSpeeds(
+      scaledSpeed(speed, LEFT_PIVOT_RF_PERCENT) * FWD_RF,
+      scaledSpeed(speed, LEFT_PIVOT_RR_PERCENT) * FWD_RR,
+      scaledSpeed(-speed, LEFT_PIVOT_LR_PERCENT) * FWD_LR,
+      scaledSpeed(-speed, LEFT_PIVOT_LF_PERCENT) * FWD_LF);
+}
+
+void updateEncoderFromPins(uint8_t index)
+{
+  bool a = digitalRead(ENC_A[index]);
+  bool b = digitalRead(ENC_B[index]);
+  encoderCounts[index] += (a == b) ? 1 : -1;
+}
+
+void pollEncoders()
+{
+  for (uint8_t i = 0; i < NUM_ENCODERS; i++) {
+    bool a = digitalRead(ENC_A[i]);
+    if (a != lastEncoderA[i]) {
+      lastEncoderA[i] = a;
+      updateEncoderFromPins(i);
+    }
+  }
+}
+
+void resetEncoders()
+{
+  for (uint8_t i = 0; i < NUM_ENCODERS; i++) {
+    encoderCounts[i] = 0;
+    lastLoggedCounts[i] = 0;
+    lastStallCounts[i] = 0;
+    lastEncoderA[i] = digitalRead(ENC_A[i]);
+  }
+}
+
+void beginEncoders()
+{
+  for (uint8_t i = 0; i < NUM_ENCODERS; i++) {
+    pinMode(ENC_A[i], INPUT_PULLUP);
+    pinMode(ENC_B[i], INPUT_PULLUP);
+    lastEncoderA[i] = digitalRead(ENC_A[i]);
+  }
+  resetEncoders();
+}
+
+long encoderMotionSince(long previousCounts[NUM_ENCODERS])
+{
+  long motion = 0;
+  for (uint8_t i = 0; i < NUM_ENCODERS; i++) {
+    motion += labs(encoderCounts[i] - previousCounts[i]);
+  }
+  return motion;
+}
+
+void copyEncoderCounts(long target[NUM_ENCODERS])
+{
+  for (uint8_t i = 0; i < NUM_ENCODERS; i++) {
+    target[i] = encoderCounts[i];
+  }
+}
+
+void setupMotoron(MotoronI2C &mc, uint8_t m1, uint8_t m2 = 0, uint8_t m3 = 0)
+{
+  mc.setBus(&Wire1);
+  mc.reinitialize();
+  mc.disableCrc();
+  mc.clearResetFlag();
+
+  mc.setMaxAcceleration(m1, 0);
+  mc.setMaxDeceleration(m1, 0);
+  mc.setSpeed(m1, 0);
+
+  if (m2 != 0) {
+    mc.setMaxAcceleration(m2, 0);
+    mc.setMaxDeceleration(m2, 0);
+    mc.setSpeed(m2, 0);
+  }
+
+  if (m3 != 0) {
+    mc.setMaxAcceleration(m3, 0);
+    mc.setMaxDeceleration(m3, 0);
+    mc.setSpeed(m3, 0);
+  }
+}
+
+void scanI2CBus(TwoWire &bus, const char *name)
+{
+  Serial.print("I2C | Scanning ");
+  Serial.println(name);
+
+  int count = 0;
+  for (uint8_t address = 1; address < 127; address++) {
+    bus.beginTransmission(address);
+    uint8_t error = bus.endTransmission();
+
+    if (error == 0) {
+      Serial.print("I2C | Found 0x");
+      if (address < 16) {
+        Serial.print("0");
+      }
+      Serial.println(address, HEX);
+      count++;
+    }
+  }
+
+  if (count == 0) {
+    Serial.println("I2C | No devices found.");
+  }
+}
+
+bool initIMU()
+{
+  const bool ad0Values[] = {false, true};
+
+  for (uint8_t i = 0; i < 2; i++) {
+    imuAd0Val = ad0Values[i];
+
+    Serial.print("IMU | Trying AD0=");
+    Serial.print(imuAd0Val ? 1 : 0);
+    Serial.print(" address 0x");
+    Serial.println(imuAd0Val ? "69" : "68");
+
+    imu.begin(Wire, imuAd0Val);
+    Serial.print("IMU | Status: ");
+    Serial.println(imu.statusString());
+
+    if (imu.status == ICM_20948_Stat_Ok) {
+      Serial.print("IMU | Ready at 0x");
+      Serial.println(imuAd0Val ? "69" : "68");
+      return true;
+    }
+
+    delay(100);
+  }
+
+  return false;
+}
+
+void calibrateGyroZ()
+{
+  Serial.println("IMU | Calibrating gyro Z. Keep robot still...");
+
+  const int samples = 300;
+  float sum = 0.0;
+  int count = 0;
+
+  while (count < samples) {
+    if (imu.dataReady()) {
+      imu.getAGMT();
+      sum += imu.gyrZ();
+      count++;
+    }
+    delay(5);
+  }
+
+  gyroZBias = sum / samples;
+  Serial.print("IMU | Gyro Z bias = ");
+  Serial.println(gyroZBias, 6);
+}
+
+void updateYaw()
+{
+  if (!imu.dataReady()) {
+    return;
+  }
+
+  imu.getAGMT();
+
+  unsigned long nowMicros = micros();
+  float dt = (nowMicros - lastUpdateMicros) / 1000000.0;
+  lastUpdateMicros = nowMicros;
+
+  yawDeg += (imu.gyrZ() - gyroZBias) * dt;
+}
+
+float turnedDeg()
+{
+  return fabs(yawDeg - startYawDeg);
+}
+
+float turnErrorDeg()
+{
+  return TURN_TARGET_DEG - turnedDeg();
+}
+
+float limitedSegmentTarget(float currentDeg)
+{
+  float target = currentDeg + TURN_SEGMENT_DEG;
+  if (target > TURN_TARGET_DEG) {
+    target = TURN_TARGET_DEG;
+  }
+  return target;
+}
+
+int16_t approachSpeedForError(float remainingDeg)
+{
+  if (remainingDeg > TURN_MID_REMAINING_DEG) {
+    return TURN_FAST_SPEED;
+  }
+
+  if (remainingDeg > TURN_FINE_REMAINING_DEG) {
+    return TURN_MID_SPEED;
+  }
+
+  return TURN_FINE_SPEED;
+}
+
+void printRawPivotRight(int16_t speed)
+{
+  Serial.print("RAW | RIGHT RF=");
+  Serial.print(scaledSpeed(-speed, RIGHT_PIVOT_RF_PERCENT) * FWD_RF);
+  Serial.print(" RR=");
+  Serial.print(scaledSpeed(-speed, RIGHT_PIVOT_RR_PERCENT) * FWD_RR);
+  Serial.print(" LR=");
+  Serial.print(scaledSpeed(speed, RIGHT_PIVOT_LR_PERCENT) * FWD_LR);
+  Serial.print(" LF=");
+  Serial.println(scaledSpeed(speed, RIGHT_PIVOT_LF_PERCENT) * FWD_LF);
+}
+
+void printRawPivotLeft(int16_t speed)
+{
+  Serial.print("RAW | LEFT RF=");
+  Serial.print(scaledSpeed(speed, LEFT_PIVOT_RF_PERCENT) * FWD_RF);
+  Serial.print(" RR=");
+  Serial.print(scaledSpeed(speed, LEFT_PIVOT_RR_PERCENT) * FWD_RR);
+  Serial.print(" LR=");
+  Serial.print(scaledSpeed(-speed, LEFT_PIVOT_LR_PERCENT) * FWD_LR);
+  Serial.print(" LF=");
+  Serial.println(scaledSpeed(-speed, LEFT_PIVOT_LF_PERCENT) * FWD_LF);
+}
+
+void printStatus(int16_t speedCommand)
+{
+  Serial.print("TURN | state=");
+  Serial.print(stateName(turnState));
+  Serial.print(" yaw=");
+  Serial.print(yawDeg, 1);
+  Serial.print(" delta=");
+  Serial.print(turnedDeg(), 1);
+  Serial.print("/");
+  Serial.print(TURN_TARGET_DEG, 1);
+  Serial.print(" error=");
+  Serial.print(turnErrorDeg(), 1);
+  Serial.print(" speed=");
+  Serial.print(speedCommand);
+  Serial.print(" segmentTarget=");
+  Serial.print(segmentTargetDeg, 1);
+  Serial.print(" enc RF=");
+  Serial.print(encoderCounts[0]);
+  Serial.print(" RR=");
+  Serial.print(encoderCounts[1]);
+  Serial.print(" LR=");
+  Serial.print(encoderCounts[2]);
+  Serial.print(" LF=");
+  Serial.print(encoderCounts[3]);
+  Serial.print(" d100=");
+
+  for (uint8_t i = 0; i < NUM_ENCODERS; i++) {
+    long delta = encoderCounts[i] - lastLoggedCounts[i];
+    lastLoggedCounts[i] = encoderCounts[i];
+    Serial.print(delta);
+    if (i < NUM_ENCODERS - 1) {
+      Serial.print(",");
+    }
+  }
+
+  Serial.println();
+}
+
+void enterState(TurnState nextState)
+{
+  turnState = nextState;
+  stateStartMs = millis();
+
+  Serial.print("STATE | ");
+  Serial.println(stateName(turnState));
+}
+
+void printSummary(const char *reason)
+{
+  stopAllMotors();
+  Serial.print("SUMMARY | ");
+  Serial.print(reason);
+  Serial.print(" yaw=");
+  Serial.print(yawDeg, 2);
+  Serial.print(" delta=");
+  Serial.print(turnedDeg(), 2);
+  Serial.print(" error=");
+  Serial.println(turnErrorDeg(), 2);
+
+  Serial.print("SUMMARY | ENC RF=");
+  Serial.print(encoderCounts[0]);
+  Serial.print(" RR=");
+  Serial.print(encoderCounts[1]);
+  Serial.print(" LR=");
+  Serial.print(encoderCounts[2]);
+  Serial.print(" LF=");
+  Serial.println(encoderCounts[3]);
+
+  Serial.println("SUMMARY | Send me these summary lines if you want encoder stop targets.");
+}
+
+void startTurn()
+{
+  resetEncoders();
+  yawDeg = 0.0;
+  startYawDeg = yawDeg;
+  lastUpdateMicros = micros();
+  turnStartMs = millis();
+  lastStatusMs = 0;
+  lastStallCheckMs = turnStartMs;
+  lastStallYawDeg = yawDeg;
+  segmentTargetDeg = limitedSegmentTarget(turnedDeg());
+  nextReliefForward = true;
+  copyEncoderCounts(lastStallCounts);
+
+  Serial.println("RUN | IMU_ENCODER_LEFT90 START");
+  Serial.print("RUN | target=");
+  Serial.print(TURN_TARGET_DEG, 1);
+  Serial.print(" tolerance=+/-");
+  Serial.println(TURN_TOLERANCE_DEG, 1);
+  Serial.print("RUN | segmented turn step=");
+  Serial.print(TURN_SEGMENT_DEG, 1);
+  Serial.print(" relief=");
+  Serial.print(RELIEF_PULSE_MS);
+  Serial.println("ms alternating forward/back");
+  printRawPivotLeft(TURN_FAST_SPEED);
+
+  enterState(TURN_LEFT_APPROACH);
+}
+
+void checkStallWarning()
+{
+  unsigned long now = millis();
+  if (now - lastStallCheckMs < STALL_CHECK_MS) {
+    return;
+  }
+
+  float yawMotion = fabs(yawDeg - lastStallYawDeg);
+  long encoderMotion = encoderMotionSince(lastStallCounts);
+
+  if (turnState != SETTLE_AFTER_APPROACH && turnState != DONE && yawMotion < 1.0 && encoderMotion < 3) {
+    Serial.print("WARN | little motion in ");
+    Serial.print(STALL_CHECK_MS);
+    Serial.print("ms yawMotion=");
+    Serial.print(yawMotion, 2);
+    Serial.print(" encMotion=");
+    Serial.println(encoderMotion);
+  }
+
+  lastStallCheckMs = now;
+  lastStallYawDeg = yawDeg;
+  copyEncoderCounts(lastStallCounts);
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("====================================");
+  Serial.println("IMU + ENCODER LEFT 90 TEST");
+  Serial.println("IMU controls angle; encoders are logged.");
+  Serial.println("Polarity: RF=-1 RR=1 LR=-1 LF=-1");
+  Serial.println("====================================");
+
+  beginEncoders();
+
+  Wire.begin();
+  Wire.setClock(400000);
+  scanI2CBus(Wire, "Wire IMU bus");
+
+  while (!initIMU()) {
+    Serial.println("IMU | Not ready, retrying...");
+    delay(500);
+  }
+
+  Wire1.begin();
+  Wire1.setClock(400000);
+  scanI2CBus(Wire1, "Wire1 Motoron bus");
+
+  setupMotoron(mcLower, RF, RR, LR);
+  setupMotoron(mcUpper, LF);
+  stopAllMotors();
+
+  calibrateGyroZ();
+
+  Serial.print("Starting in ");
+  Serial.print(START_DELAY_MS / 1000.0, 1);
+  Serial.println(" seconds...");
+  delay(START_DELAY_MS);
+
+  startTurn();
+}
+
+void loop()
+{
+  pollEncoders();
+  updateYaw();
+
+  if (turnState == DONE) {
+    stopAllMotors();
+    delay(100);
+    return;
+  }
+
+  unsigned long now = millis();
+  float error = turnErrorDeg();
+  int16_t speedCommand = 0;
+
+  if (now - turnStartMs >= TURN_TIMEOUT_MS) {
+    printSummary("timeout");
+    enterState(DONE);
+    return;
+  }
+
+  switch (turnState) {
+    case TURN_LEFT_APPROACH:
+      if (error <= 0.0) {
+        stopAllMotors();
+        enterState(SETTLE_AFTER_APPROACH);
+      } else if (turnedDeg() >= segmentTargetDeg && error > TURN_FINE_REMAINING_DEG) {
+        stopAllMotors();
+        enterState(SEGMENT_STOP);
+      } else {
+        speedCommand = approachSpeedForError(error);
+        pivotLeft(speedCommand);
+      }
+      break;
+
+    case SEGMENT_STOP:
+      stopAllMotors();
+      if (now - stateStartMs >= SEGMENT_STOP_MS) {
+        error = turnErrorDeg();
+
+        if (error <= 0.0 || fabs(error) <= TURN_TOLERANCE_DEG) {
+          enterState(SETTLE_AFTER_APPROACH);
+        } else if (error <= TURN_FINE_REMAINING_DEG) {
+          segmentTargetDeg = limitedSegmentTarget(turnedDeg());
+          enterState(TURN_LEFT_APPROACH);
+        } else if (nextReliefForward) {
+          enterState(RELIEF_FORWARD);
+        } else {
+          enterState(RELIEF_BACKWARD);
+        }
+      }
+      break;
+
+    case RELIEF_FORWARD:
+      driveStraight(RELIEF_SPEED);
+      speedCommand = RELIEF_SPEED;
+      if (now - stateStartMs >= RELIEF_PULSE_MS) {
+        stopAllMotors();
+        nextReliefForward = false;
+        segmentTargetDeg = limitedSegmentTarget(turnedDeg());
+        enterState(TURN_LEFT_APPROACH);
+      }
+      break;
+
+    case RELIEF_BACKWARD:
+      driveStraight(-RELIEF_SPEED);
+      speedCommand = -RELIEF_SPEED;
+      if (now - stateStartMs >= RELIEF_PULSE_MS) {
+        stopAllMotors();
+        nextReliefForward = true;
+        segmentTargetDeg = limitedSegmentTarget(turnedDeg());
+        enterState(TURN_LEFT_APPROACH);
+      }
+      break;
+
+    case SETTLE_AFTER_APPROACH:
+      stopAllMotors();
+      if (now - stateStartMs >= SETTLE_MS) {
+        error = turnErrorDeg();
+
+        if (fabs(error) <= TURN_TOLERANCE_DEG) {
+          printSummary("target_reached");
+          enterState(DONE);
+        } else if (error > 0.0) {
+          enterState(FINE_CORRECT_LEFT);
+        } else {
+          enterState(FINE_CORRECT_RIGHT);
+        }
+      }
+      break;
+
+    case FINE_CORRECT_RIGHT:
+      if (fabs(error) <= TURN_TOLERANCE_DEG) {
+        stopAllMotors();
+        printSummary("fine_right_done");
+        enterState(DONE);
+      } else if (error > TURN_TOLERANCE_DEG) {
+        stopAllMotors();
+        enterState(SETTLE_AFTER_APPROACH);
+      } else {
+        speedCommand = TURN_FINE_SPEED;
+        pivotRight(speedCommand);
+      }
+      break;
+
+    case FINE_CORRECT_LEFT:
+      if (fabs(error) <= TURN_TOLERANCE_DEG) {
+        stopAllMotors();
+        printSummary("fine_left_done");
+        enterState(DONE);
+      } else if (error < -TURN_TOLERANCE_DEG) {
+        stopAllMotors();
+        enterState(SETTLE_AFTER_APPROACH);
+      } else {
+        speedCommand = TURN_FINE_SPEED;
+        pivotLeft(speedCommand);
+      }
+      break;
+
+    case WAITING_TO_START:
+    case DONE:
+      stopAllMotors();
+      break;
+  }
+
+  if (now - lastStatusMs >= STATUS_INTERVAL_MS) {
+    lastStatusMs = now;
+    printStatus(speedCommand);
+  }
+
+  checkStallWarning();
+  delay(2);
+}
