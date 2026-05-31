@@ -34,6 +34,9 @@ const uint8_t RIGHT_PIVOT_RF_PERCENT = 100;
 const uint8_t RIGHT_PIVOT_RR_PERCENT = 100;
 const uint8_t RIGHT_PIVOT_LR_PERCENT = 100;
 const uint8_t RIGHT_PIVOT_LF_PERCENT = 100;
+
+// Left turn tuning:
+// RR is reduced to 75% to reduce translation drift during left turns.
 const uint8_t LEFT_PIVOT_RF_PERCENT = 100;
 const uint8_t LEFT_PIVOT_RR_PERCENT = 100;
 const uint8_t LEFT_PIVOT_LR_PERCENT = 100;
@@ -53,9 +56,14 @@ const unsigned long STATUS_INTERVAL_MS = 100;
 const unsigned long STALL_CHECK_MS = 500;
 
 // Encoder order: RF, RR, LR, LF.
+// Latest physical wiring:
+// RF right-front: C1 -> D18, C2 -> D19
+// RR right-rear:  C1 -> D2,  C2 -> D3
+// LR left-rear:   C1 -> D4,  C2 -> D5
+// LF left-front:  C1 -> D8,  C2 -> D9
 const uint8_t NUM_ENCODERS = 4;
-const uint8_t ENC_A[NUM_ENCODERS] = {2, 4, 6, 8};
-const uint8_t ENC_B[NUM_ENCODERS] = {3, 5, 7, 9};
+const uint8_t ENC_A[NUM_ENCODERS] = {18, 2, 4, 8};
+const uint8_t ENC_B[NUM_ENCODERS] = {19, 3, 5, 9};
 long encoderCounts[NUM_ENCODERS] = {0, 0, 0, 0};
 long lastLoggedCounts[NUM_ENCODERS] = {0, 0, 0, 0};
 long lastStallCounts[NUM_ENCODERS] = {0, 0, 0, 0};
