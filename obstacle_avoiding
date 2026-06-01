@@ -64,7 +64,7 @@ const int16_t LINE_FORWARD_SPEED = 580;
 const int16_t GRID_FORWARD_SPEED = 610;
 const int16_t TURN_FAST_SPEED = 720;
 const int16_t TURN_FINE_SPEED = 580;
-const float OBSTACLE_DETECT_CM = 20.0;
+const float OBSTACLE_DETECT_CM = 15.0;
 const float TURN_TARGET_DEG = 90.0;
 const float TURN_TOLERANCE_DEG = 2.0;
 const float TURN_FINE_REMAINING_DEG = 12.0;
@@ -81,6 +81,13 @@ const unsigned long RFID_CHECK_INTERVAL_MS = 80;
 const unsigned long RFID_RETRY_INTERVAL_MS = 1000;
 const unsigned long STATUS_INTERVAL_MS = 250;
 const unsigned long SENSOR_PRINT_INTERVAL_MS = 120;
+const unsigned int GRID_CROSS_THRESHOLD = 300;
+const unsigned int GRID_CROSS_EDGE_THRESHOLD = 280;
+const int GRID_CROSS_MIN_TOTAL = 1350;
+const uint8_t GRID_CROSS_MIN_ACTIVE = 3;
+const unsigned long GRID_CROSS_COOLDOWN_MS = 650;
+const float GRID_NO_LINE_YAW_KP = 16.0;
+const int16_t GRID_NO_LINE_MAX_CORRECTION = 180;
 
 struct UltrasonicSensor
 {
@@ -132,6 +139,9 @@ uint8_t nodeTarget = 0;
 uint32_t lastNodeUid = 0;
 bool haveLastNodeUid = false;
 unsigned long lastNodeMs = 0;
+float straightTargetYawDeg = 0.0;
+bool gridCrossLatched = false;
+unsigned long lastGridCrossMs = 0;
 
 const char *stateName(GridState value)
 {
@@ -390,6 +400,40 @@ bool computeLineError(float &error)
   return true;
 }
 
+float normalizeAngleDeg(float angle)
+{
+  while (angle > 180.0)
+  {
+    angle -= 360.0;
+  }
+  while (angle < -180.0)
+  {
+    angle += 360.0;
+  }
+  return angle;
+}
+
+bool gridCrossDetected()
+{
+  uint8_t activeCount = 0;
+  int signalTotal = 0;
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++)
+  {
+    signalTotal += sensorValues[i];
+    if (sensorValues[i] >= GRID_CROSS_THRESHOLD)
+    {
+      activeCount++;
+    }
+  }
+
+  bool leftEdge = sensorValues[0] >= GRID_CROSS_EDGE_THRESHOLD || sensorValues[1] >= GRID_CROSS_EDGE_THRESHOLD;
+  bool rightEdge = sensorValues[3] >= GRID_CROSS_EDGE_THRESHOLD || sensorValues[4] >= GRID_CROSS_EDGE_THRESHOLD;
+  return activeCount >= GRID_CROSS_MIN_ACTIVE &&
+         signalTotal >= GRID_CROSS_MIN_TOTAL &&
+         leftEdge &&
+         rightEdge;
+}
+
 void driveLineFollow(int16_t baseSpeed)
 {
   readSensors();
@@ -424,7 +468,14 @@ void driveLineFollow(int16_t baseSpeed)
   }
   else
   {
-    driveForward(baseSpeed);
+    float yawError = normalizeAngleDeg(straightTargetYawDeg - yawDeg);
+    int16_t correction = constrain(
+        (int16_t)(-yawError * GRID_NO_LINE_YAW_KP),
+        (int16_t)-GRID_NO_LINE_MAX_CORRECTION,
+        (int16_t) GRID_NO_LINE_MAX_CORRECTION);
+    int16_t leftSpeed = constrain((int16_t)(baseSpeed - correction), -MAX_SPEED, MAX_SPEED);
+    int16_t rightSpeed = constrain((int16_t)(baseSpeed + correction), -MAX_SPEED, MAX_SPEED);
+    driveBySide(leftSpeed, rightSpeed);
   }
 }
 
@@ -564,6 +615,8 @@ bool readNode()
   haveLastNodeUid = true;
   lastNodeUid = uidHash;
   lastNodeMs = millis();
+  gridCrossLatched = true;
+  lastGridCrossMs = millis();
   nodeCount++;
 
   Serial.print("GRID_NODE | ");
@@ -572,6 +625,43 @@ bool readNode()
   Serial.print(nodeTarget);
   Serial.print(" uid=0x");
   Serial.println(uidHash, HEX);
+  return true;
+}
+
+bool readNodeByGridCross()
+{
+  if (millis() - stateStartMs < NODE_ARM_DELAY_MS)
+  {
+    return false;
+  }
+
+  bool detected = gridCrossDetected();
+  if (!detected)
+  {
+    gridCrossLatched = false;
+    return false;
+  }
+
+  if (gridCrossLatched || millis() - lastGridCrossMs < GRID_CROSS_COOLDOWN_MS)
+  {
+    return false;
+  }
+
+  gridCrossLatched = true;
+  lastGridCrossMs = millis();
+  nodeCount++;
+
+  Serial.print("GRID_NODE_LINE | ");
+  Serial.print(nodeCount);
+  Serial.print("/");
+  Serial.print(nodeTarget);
+  Serial.print(" total=");
+  int signalTotal = 0;
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++)
+  {
+    signalTotal += sensorValues[i];
+  }
+  Serial.println(signalTotal);
   return true;
 }
 
@@ -596,6 +686,9 @@ void beginStraight(GridState nextState, uint8_t targetNodes)
 {
   nodeCount = 0;
   nodeTarget = targetNodes;
+  straightTargetYawDeg = yawDeg;
+  gridCrossLatched = false;
+  lastGridCrossMs = millis();
   enterState(nextState);
 }
 
@@ -754,7 +847,10 @@ void turnStep()
 void straightStep()
 {
   driveLineFollow(GRID_FORWARD_SPEED);
-  readNode();
+  if (!readNode())
+  {
+    readNodeByGridCross();
+  }
 
   if (nodeCount >= nodeTarget)
   {
