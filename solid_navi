@@ -69,6 +69,7 @@ const unsigned long RFID_RETRY_INTERVAL_MS = 1000;
 const unsigned long STATUS_INTERVAL_MS = 200;
 const unsigned long SENSOR_PRINT_INTERVAL_MS = 120;
 const unsigned long RUN_TIME_LIMIT_MS = 60000;
+const unsigned long STARTUP_BLINK_MS = 300;
 
 const float LINE_PID_KP = 0.22;
 const float LINE_PID_KI = 0.03;
@@ -111,6 +112,10 @@ unsigned long lastGridCrossMs = 0;
 bool gridCrossLatched = false;
 bool rfidReady = false;
 bool killStopped = false;
+bool startupWaiting = true;
+bool startupRedOn = true;
+bool ignoreD45UntilReleased = false;
+unsigned long startupLastBlinkMs = 0;
 bool haveLastNodeUid = false;
 uint32_t lastNodeUid = 0;
 unsigned long lastNodeMs = 0;
@@ -866,13 +871,25 @@ void printStatus()
 
 void updateButtons()
 {
-  if (digitalRead(KILL_BUTTON_PIN) == LOW)
+  if (ignoreD45UntilReleased)
+  {
+    if (digitalRead(KILL_BUTTON_PIN) == HIGH)
+    {
+      ignoreD45UntilReleased = false;
+    }
+  }
+  else if (digitalRead(KILL_BUTTON_PIN) == LOW)
   {
     if (!killStopped)
     {
       Serial.println("KILL | D45 stop.");
     }
     killStopped = true;
+  }
+
+  if (digitalRead(KILL_BUTTON_PIN) == LOW)
+  {
+    return;
   }
 
   if (digitalRead(REVIVE_BUTTON_PIN) == LOW)
@@ -885,8 +902,40 @@ void updateButtons()
     killStopped = false;
   }
 
-  digitalWrite(LED_RED_PIN, killStopped ? HIGH : LOW);
-  digitalWrite(LED_GREEN_PIN, killStopped ? LOW : HIGH);
+  digitalWrite(LED_RED_PIN, HIGH);
+  digitalWrite(LED_GREEN_PIN, LOW);
+}
+
+bool handleStartupWait()
+{
+  if (!startupWaiting)
+  {
+    return false;
+  }
+
+  stopAllMotors();
+  if (millis() - startupLastBlinkMs >= STARTUP_BLINK_MS)
+  {
+    startupLastBlinkMs = millis();
+    startupRedOn = !startupRedOn;
+  }
+  digitalWrite(LED_RED_PIN, startupRedOn ? HIGH : LOW);
+  digitalWrite(LED_GREEN_PIN, LOW);
+
+  if (digitalRead(KILL_BUTTON_PIN) == LOW)
+  {
+    startupWaiting = false;
+    ignoreD45UntilReleased = true;
+    killStopped = false;
+    runStartMs = millis();
+    stateStartMs = millis();
+    lastUpdateMicros = micros();
+    digitalWrite(LED_RED_PIN, HIGH);
+    digitalWrite(LED_GREEN_PIN, LOW);
+    Serial.println("STARTUP | D45 pressed. Algorithm enabled.");
+  }
+
+  return true;
 }
 
 void setup()
@@ -920,23 +969,30 @@ void setup()
   calibrateGyroZ();
   rfidReady = initRFIDNoResetPin();
 
-  killStopped = digitalRead(KILL_BUTTON_PIN) == LOW;
+  killStopped = true;
+  startupWaiting = true;
+  startupRedOn = true;
+  startupLastBlinkMs = millis();
   runStartMs = millis();
   stateStartMs = millis();
 
   Serial.println("SOLID_NAVI | Ready.");
   Serial.println("SOLID_NAVI | Route: F2 -> R90 -> F1 -> L90 -> F2.");
-  Serial.println("SOLID_NAVI | D45 stop, D32 run/resume.");
-  if (killStopped)
-  {
-    Serial.println("SOLID_NAVI | D45 held at boot, stopped.");
-  }
+  Serial.println("SOLID_NAVI | Startup: motors stopped, red blinks. Press D45 once to start.");
 }
 
 void loop()
 {
   updateYaw();
   updateRFIDReady();
+
+  if (handleStartupWait())
+  {
+    printStatus();
+    delay(5);
+    return;
+  }
+
   updateButtons();
 
   if (killStopped)
