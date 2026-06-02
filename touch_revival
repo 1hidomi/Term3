@@ -60,6 +60,7 @@ const unsigned long STATUS_INTERVAL_MS = 150;
 const unsigned long RUN_TIME_LIMIT_MS = 60000;
 const unsigned long CONTACT_HOLD_MS = 450;
 const unsigned long FINAL_SETTLE_MS = 900;
+const unsigned long STARTUP_BLINK_MS = 300;
 const uint8_t CLOSE_INVALID_LIMIT = 3;
 const uint32_t ULTRASONIC_TIMEOUT_US = 25000;
 const float ULTRASONIC_FILTER_ALPHA = 0.46;
@@ -93,6 +94,10 @@ unsigned long lastControlMs = 0;
 unsigned long lastStatusMs = 0;
 bool runEnabled = true;
 bool runComplete = false;
+bool startupWaiting = true;
+bool startupRedOn = true;
+bool ignoreD45UntilReleased = false;
+unsigned long startupLastBlinkMs = 0;
 int16_t currentCommandSpeed = 0;
 float lastValidFrontCm = -1.0;
 uint8_t closeInvalidCount = 0;
@@ -338,7 +343,14 @@ void printStatus(int16_t targetSpeed)
 
 void updateButtons()
 {
-  if (digitalRead(KILL_BUTTON_PIN) == LOW)
+  if (ignoreD45UntilReleased)
+  {
+    if (digitalRead(KILL_BUTTON_PIN) == HIGH)
+    {
+      ignoreD45UntilReleased = false;
+    }
+  }
+  else if (digitalRead(KILL_BUTTON_PIN) == LOW)
   {
     if (runEnabled)
     {
@@ -362,8 +374,43 @@ void updateButtons()
     enterState(SEARCH_TARGET);
   }
 
-  digitalWrite(LED_RED_PIN, runEnabled && !runComplete ? LOW : HIGH);
-  digitalWrite(LED_GREEN_PIN, runEnabled && !runComplete ? HIGH : LOW);
+  digitalWrite(LED_RED_PIN, HIGH);
+  digitalWrite(LED_GREEN_PIN, LOW);
+}
+
+bool handleStartupWait()
+{
+  if (!startupWaiting)
+  {
+    return false;
+  }
+
+  stopAllMotors();
+  if (millis() - startupLastBlinkMs >= STARTUP_BLINK_MS)
+  {
+    startupLastBlinkMs = millis();
+    startupRedOn = !startupRedOn;
+  }
+  digitalWrite(LED_RED_PIN, startupRedOn ? HIGH : LOW);
+  digitalWrite(LED_GREEN_PIN, LOW);
+
+  if (digitalRead(KILL_BUTTON_PIN) == LOW)
+  {
+    startupWaiting = false;
+    ignoreD45UntilReleased = true;
+    runEnabled = true;
+    runComplete = false;
+    currentCommandSpeed = 0;
+    closeInvalidCount = 0;
+    lastValidFrontCm = -1.0;
+    runStartMs = millis();
+    digitalWrite(LED_RED_PIN, HIGH);
+    digitalWrite(LED_GREEN_PIN, LOW);
+    enterState(SEARCH_TARGET);
+    Serial.println("STARTUP | D45 pressed. Algorithm enabled.");
+  }
+
+  return true;
 }
 
 void revivalStep()
@@ -472,21 +519,27 @@ void setup()
   setupMotoron(mcUpper, LF);
   stopAllMotors();
 
-  runEnabled = digitalRead(KILL_BUTTON_PIN) != LOW;
+  runEnabled = false;
+  startupWaiting = true;
+  startupRedOn = true;
+  startupLastBlinkMs = millis();
   runStartMs = millis();
   stateStartMs = millis();
 
   Serial.println("TOUCH_REVIVAL | Ready.");
   Serial.println("TOUCH_REVIVAL | Front ultrasonic controls smooth deceleration and gentle contact.");
-  Serial.println("TOUCH_REVIVAL | D45 stop, D32 restart.");
-  if (!runEnabled)
-  {
-    Serial.println("TOUCH_REVIVAL | D45 held at boot, stopped.");
-  }
+  Serial.println("TOUCH_REVIVAL | Startup: motors stopped, red blinks. Press D45 once to start.");
 }
 
 void loop()
 {
+  if (handleStartupWait())
+  {
+    printStatus(0);
+    delay(5);
+    return;
+  }
+
   updateButtons();
 
   if (!runEnabled)
