@@ -13,7 +13,7 @@ MotoronI2C mcUpper(UPPER_MOTORON_ADDR);
 
 // Lower shield: RF/RR/LR on M1/M2/M3. Upper shield: LF on M1.
 const uint8_t RF = 1;
-const uint8_t RR = 2;a
+const uint8_t RR = 2;
 const uint8_t LR = 3;
 const uint8_t LF = 1;
 
