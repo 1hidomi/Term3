@@ -181,7 +181,7 @@ const uint8_t LEFT_PIVOT_RF_PERCENT = 100;
 const uint8_t LEFT_PIVOT_RR_PERCENT = 100;
 const uint8_t LEFT_PIVOT_LR_PERCENT = 100;
 const uint8_t LEFT_PIVOT_LF_PERCENT = 100;
-const int16_t NO_LINE_FORWARD_SPEED = 400;
+const int16_t NO_LINE_FORWARD_SPEED = 320;
 const int16_t NO_LINE_YAW_MAX_CORRECTION = 120;
 const float NO_LINE_YAW_KP = 18.0;
 const unsigned int LINE_PID_SIGNAL_FLOOR = 240;
@@ -205,8 +205,11 @@ const float PRE_TURN_FORWARD_LEFT_CM = 1.3;
 const float PRE_TURN_FORWARD_RIGHT_CM = 4.0;
 const float PRE_TURN_MS_PER_CM_AT_SPEED_700 = 55.6;
 const float PRE_TURN_MS_PER_CM = PRE_TURN_MS_PER_CM_AT_SPEED_700 * 700.0 / FORWARD_SPEED;
-const uint16_t PRE_TURN_FORWARD_LEFT_MS = (uint16_t)(PRE_TURN_FORWARD_LEFT_CM * PRE_TURN_MS_PER_CM + 0.5);
-const uint16_t PRE_TURN_FORWARD_RIGHT_MS = (uint16_t)(PRE_TURN_FORWARD_RIGHT_CM * PRE_TURN_MS_PER_CM + 0.5);
+const uint16_t PRE_TURN_EXTRA_MS = 200;
+const uint16_t PRE_TURN_FORWARD_LEFT_MS =
+    (uint16_t)(PRE_TURN_FORWARD_LEFT_CM * PRE_TURN_MS_PER_CM + 0.5) + PRE_TURN_EXTRA_MS;
+const uint16_t PRE_TURN_FORWARD_RIGHT_MS =
+    (uint16_t)(PRE_TURN_FORWARD_RIGHT_CM * PRE_TURN_MS_PER_CM + 0.5) + PRE_TURN_EXTRA_MS;
 const uint16_t AFTER_TURN_SETTLE_MS = 120;
 const uint16_t RIGHT_ANGLE_TIMEOUT_MS = 14000;
 const float RIGHT_ANGLE_TARGET_DEG = 90.0;
@@ -232,8 +235,8 @@ const long POST_TURN_MIN_ENCODER_TICKS = 3;
 const int16_t POST_TURN_BACKUP_SPEED = 620;
 const uint16_t POST_TURN_BACKUP_MS = 320;
 const int16_t FIND_LINE_SPEED = 1000;
-const int16_t WALL_FORWARD_SPEED = 750;
-const int16_t WALL_MIN_DRIVE_SPEED = 750;
+const int16_t WALL_FORWARD_SPEED = 600;
+const int16_t WALL_MIN_DRIVE_SPEED = 600;
 const float WALL_MIN_SIDE_CLEARANCE_CM = 6.0;
 const int16_t WALL_PD_MAX_CORRECTION = 420;
 const float WALL_CENTER_KP = 42.0;
@@ -245,6 +248,10 @@ const uint16_t NO_LINE_WALL_ENTRY_MIN_MS = 300;
 const uint16_t NO_LINE_RETURN_YAW_TIMEOUT_MS = 1800;
 const float NO_LINE_RETURN_YAW_TOLERANCE_DEG = 3.0;
 const int16_t NO_LINE_RETURN_YAW_SPEED = 650;
+const bool ENABLE_UPHILL_LINE_FLICKER_GUARD = true;
+const uint16_t UPHILL_LINE_FLICKER_WINDOW_MS = 3500;
+const uint8_t UPHILL_LINE_FLICKER_TRIGGER_TRANSITIONS = 4;
+const uint16_t UPHILL_LINE_IGNORE_MS = 5000;
 const uint16_t FIND_LINE_SMALL_MS = 700;
 const uint16_t FIND_LINE_BIG_MS = 2200;
 const float FIND_LINE_SMALL_SWEEP_DEG = 10.0;
@@ -320,6 +327,12 @@ unsigned long frontObstacleHoldStartMs = 0;
 uint8_t nextUltrasonicIndex = 0;
 float noLineTargetYawDeg = 0.0;
 bool noLineYawTargetLocked = false;
+unsigned long uphillLineFlickerWindowStartMs = 0;
+unsigned long uphillLineIgnoreUntilMs = 0;
+uint8_t uphillLineFlickerTransitions = 0;
+bool uphillLineFlickerHasLast = false;
+bool uphillLineFlickerLastSeen = false;
+float uphillLineFlickerYawDeg = 0.0;
 float wallPdLastError = 0.0;
 unsigned long wallPdLastMs = 0;
 bool wallPdHasLast = false;
@@ -481,6 +494,9 @@ void beginTurnAround180();
 void startGridObstacleAvoidance();
 void gridObstacleAvoidStep();
 float tiltMagnitudeDeg();
+bool uphillLineIgnoreActive();
+bool recordUphillLineFlicker(bool lineSeen, const char *source);
+void enterUphillFlickerBypass(const char *source);
 
 const char *stateName(RobotState robotState)
 {
@@ -1355,6 +1371,11 @@ void linePidFollowStep()
   {
     resetLinePid();
     stopAllMotors();
+    if (recordUphillLineFlicker(false, "SENSE_LOST"))
+    {
+      enterState(NO_LINE_RETURN_YAW);
+      return;
+    }
     enterNoLineFindState();
     return;
   }
@@ -1364,6 +1385,11 @@ void linePidFollowStep()
   {
     resetLinePid();
     stopAllMotors();
+    if (recordUphillLineFlicker(false, "PID_LOST"))
+    {
+      enterState(NO_LINE_RETURN_YAW);
+      return;
+    }
     enterNoLineFindState();
     return;
   }
@@ -1858,6 +1884,89 @@ void enterState(RobotState nextState)
       stopAllMotors();
       break;
   }
+}
+
+bool inUphillLineFlickerGuardZone()
+{
+  return ENABLE_UPHILL_LINE_FLICKER_GUARD &&
+         completedRouteTurns <= BASE_UPHILL_ROUTE_TURN_COUNT;
+}
+
+bool uphillLineIgnoreActive()
+{
+  return ENABLE_UPHILL_LINE_FLICKER_GUARD &&
+         millis() < uphillLineIgnoreUntilMs;
+}
+
+void enterUphillFlickerBypass(const char *source)
+{
+  unsigned long now = millis();
+  unsigned long ignoreUntil = now + UPHILL_LINE_IGNORE_MS;
+
+  uphillLineIgnoreUntilMs = ignoreUntil;
+  noLineTargetYawDeg = uphillLineFlickerYawDeg;
+  noLineYawTargetLocked = true;
+  if (ignoreRightAngleUntilMs < ignoreUntil)
+  {
+    ignoreRightAngleUntilMs = ignoreUntil;
+  }
+
+  uphillLineFlickerWindowStartMs = now;
+  uphillLineFlickerTransitions = 0;
+  uphillLineFlickerHasLast = false;
+  resetLinePid();
+
+  Serial.print("UPHILL_GUARD | flicker source=");
+  Serial.print(source);
+  Serial.print(" targetYaw=");
+  Serial.print(noLineTargetYawDeg, 1);
+  Serial.print(" ignoreLineMs=");
+  Serial.println(UPHILL_LINE_IGNORE_MS);
+}
+
+bool recordUphillLineFlicker(bool lineSeen, const char *source)
+{
+  if (!inUphillLineFlickerGuardZone())
+  {
+    uphillLineFlickerHasLast = false;
+    uphillLineFlickerTransitions = 0;
+    uphillLineFlickerWindowStartMs = 0;
+    return false;
+  }
+
+  unsigned long now = millis();
+  if (!uphillLineFlickerHasLast ||
+      uphillLineFlickerWindowStartMs == 0 ||
+      now - uphillLineFlickerWindowStartMs > UPHILL_LINE_FLICKER_WINDOW_MS)
+  {
+    uphillLineFlickerWindowStartMs = now;
+    uphillLineFlickerTransitions = 0;
+    uphillLineFlickerHasLast = true;
+    uphillLineFlickerLastSeen = lineSeen;
+    if (!lineSeen)
+    {
+      uphillLineFlickerYawDeg = yawDeg;
+    }
+    return false;
+  }
+
+  if (lineSeen != uphillLineFlickerLastSeen)
+  {
+    uphillLineFlickerTransitions++;
+    uphillLineFlickerLastSeen = lineSeen;
+    if (!lineSeen)
+    {
+      uphillLineFlickerYawDeg = yawDeg;
+    }
+  }
+
+  if (uphillLineFlickerTransitions >= UPHILL_LINE_FLICKER_TRIGGER_TRANSITIONS)
+  {
+    enterUphillFlickerBypass(source);
+    return true;
+  }
+
+  return false;
 }
 
 void senseLineStep()
@@ -2575,6 +2684,19 @@ void findLineStep(bool turnLeft, uint16_t timeoutMs, float targetSweepDeg, Robot
 {
   if (centerOrAnySensorOnLine())
   {
+    if (uphillLineIgnoreActive())
+    {
+      stopAllMotors();
+      Serial.println("UPHILL_GUARD | Line seen during search, ignored. Returning yaw for climb.");
+      enterState(NO_LINE_RETURN_YAW);
+      return;
+    }
+    if (recordUphillLineFlicker(true, "FIND_FOUND"))
+    {
+      stopAllMotors();
+      enterState(NO_LINE_RETURN_YAW);
+      return;
+    }
     stopAllMotors();
     ignoreRightAngleUntilMs = millis();
     noLineYawTargetLocked = false;
@@ -2625,14 +2747,26 @@ void noLineReturnYawStep()
   readSensors();
   printSensors("RETURN_YAW");
 
-  if (anySensorOnLine())
+  bool lineSeen = anySensorOnLine();
+  if (lineSeen)
   {
-    stopAllMotors();
-    ignoreRightAngleUntilMs = millis();
-    noLineYawTargetLocked = false;
-    Serial.println("NO_LINE | Line found while returning yaw.");
-    enterState(SENSE_LINE);
-    return;
+    if (uphillLineIgnoreActive())
+    {
+      // During the slope mouth bypass, line flicker is deliberately ignored.
+    }
+    else if (recordUphillLineFlicker(true, "RETURN_YAW_FOUND"))
+    {
+      stopAllMotors();
+    }
+    else
+    {
+      stopAllMotors();
+      ignoreRightAngleUntilMs = millis();
+      noLineYawTargetLocked = false;
+      Serial.println("NO_LINE | Line found while returning yaw.");
+      enterState(SENSE_LINE);
+      return;
+    }
   }
 
   float yawError = normalizedYawErrorDeg(yawDeg, noLineTargetYawDeg);
@@ -2669,12 +2803,25 @@ void noLineImuForwardStep()
 
   if (anySensorOnLine())
   {
-    stopAllMotors();
-    ignoreRightAngleUntilMs = millis();
-    noLineYawTargetLocked = false;
-    Serial.println("NO_LINE | Line detected, switching to line following.");
-    enterState(SENSE_LINE);
-    return;
+    if (uphillLineIgnoreActive())
+    {
+      // Keep climbing through the slope-mouth flicker instead of re-entering line follow.
+    }
+    else if (recordUphillLineFlicker(true, "NO_LINE_FORWARD_FOUND"))
+    {
+      stopAllMotors();
+      enterState(NO_LINE_RETURN_YAW);
+      return;
+    }
+    else
+    {
+      stopAllMotors();
+      ignoreRightAngleUntilMs = millis();
+      noLineYawTargetLocked = false;
+      Serial.println("NO_LINE | Line detected, switching to line following.");
+      enterState(SENSE_LINE);
+      return;
+    }
   }
 
   if (!USE_IMU)
@@ -2713,11 +2860,24 @@ void wallFollowStep()
 
   if (anySensorOnLine())
   {
-    stopAllMotors();
-    ignoreRightAngleUntilMs = millis();
-    Serial.println("WALL | Line detected, switching to line following.");
-    enterState(SENSE_LINE);
-    return;
+    if (uphillLineIgnoreActive())
+    {
+      // Stay in wall/yaw-hold mode while crossing the broken line at the slope mouth.
+    }
+    else if (recordUphillLineFlicker(true, "WALL_FOUND"))
+    {
+      stopAllMotors();
+      enterState(NO_LINE_RETURN_YAW);
+      return;
+    }
+    else
+    {
+      stopAllMotors();
+      ignoreRightAngleUntilMs = millis();
+      Serial.println("WALL | Line detected, switching to line following.");
+      enterState(SENSE_LINE);
+      return;
+    }
   }
 
   float leftCm = ultrasonicSensors[1].distanceCm;
