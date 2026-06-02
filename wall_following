@@ -1,0 +1,582 @@
+// Standalone wall following test.
+// Build/upload with: pio run -e wall_following -t upload
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Motoron.h>
+
+const uint8_t LOWER_MOTORON_ADDR = 0x11;
+const uint8_t UPPER_MOTORON_ADDR = 0x10;
+
+MotoronI2C mcLower(LOWER_MOTORON_ADDR);
+MotoronI2C mcUpper(UPPER_MOTORON_ADDR);
+
+// Lower shield: RF/RR/LR on M1/M2/M3. Upper shield: LF on M1.
+const uint8_t RF = 1;
+const uint8_t RR = 2;a
+const uint8_t LR = 3;
+const uint8_t LF = 1;
+
+const int8_t FWD_RF = -1;
+const int8_t FWD_RR = 1;
+const int8_t FWD_LR = -1;
+const int8_t FWD_LF = -1;
+
+const uint8_t US_FRONT_ECHO = 37;
+const uint8_t US_FRONT_TRIG = 39;
+const uint8_t US_LEFT_ECHO = 52;
+const uint8_t US_LEFT_TRIG = 44;
+const uint8_t US_RIGHT_ECHO = 46;
+const uint8_t US_RIGHT_TRIG = 48;
+
+const uint8_t REVIVE_BUTTON_PIN = 32;
+const uint8_t KILL_BUTTON_PIN = 45;
+const uint8_t LED_RED_PIN = 36;
+const uint8_t LED_GREEN_PIN = 38;
+
+const int16_t MAX_MOTOR_COMMAND = 800;
+const int16_t WALL_FORWARD_SPEED = 620;
+const int16_t WALL_MIN_DRIVE_SPEED = 300;
+const int16_t WALL_MAX_DRIVE_SPEED = 780;
+const int16_t SEARCH_FORWARD_SPEED = 360;
+
+const float WALL_TARGET_CM = 15.0;
+const float WALL_MIN_CLEARANCE_CM = 6.0;
+const float WALL_VALID_MAX_CM = 120.0;
+const float FRONT_STOP_CM = 8.0;
+const float FRONT_SLOW_CM = 18.0;
+
+const float WALL_CENTER_KP = 30.0;
+const float WALL_SINGLE_KP = 36.0;
+const float WALL_CLEARANCE_KP = 95.0;
+const float WALL_KD = 8.0;
+const float WALL_DEADBAND_CM = 1.5;
+const int16_t WALL_MAX_CORRECTION = 260;
+const int16_t WALL_CORRECTION_SLEW = 35;
+
+const uint32_t ULTRASONIC_TIMEOUT_US = 25000;
+const unsigned long ULTRASONIC_SENSOR_GAP_MS = 30;
+const unsigned long CONTROL_INTERVAL_MS = 35;
+const unsigned long STATUS_INTERVAL_MS = 150;
+const unsigned long RUN_TIME_LIMIT_MS = 45000;
+const float ULTRASONIC_FILTER_ALPHA = 0.42;
+
+struct UltrasonicSensor
+{
+  const char *name;
+  uint8_t trigPin;
+  uint8_t echoPin;
+  float rawCm;
+  float filteredCm;
+  bool hasFiltered;
+};
+
+enum FollowMode
+{
+  MODE_NO_WALL,
+  MODE_CENTER,
+  MODE_LEFT_WALL,
+  MODE_RIGHT_WALL
+};
+
+UltrasonicSensor ultrasonicSensors[] = {
+    {"Front", US_FRONT_TRIG, US_FRONT_ECHO, -1.0, -1.0, false},
+    {"Left", US_LEFT_TRIG, US_LEFT_ECHO, -1.0, -1.0, false},
+    {"Right", US_RIGHT_TRIG, US_RIGHT_ECHO, -1.0, -1.0, false},
+};
+
+const uint8_t NUM_ULTRASONIC = sizeof(ultrasonicSensors) / sizeof(ultrasonicSensors[0]);
+uint8_t nextUltrasonicIndex = 0;
+unsigned long lastUltrasonicReadMs = 0;
+unsigned long lastControlMs = 0;
+unsigned long lastStatusMs = 0;
+unsigned long runStartMs = 0;
+bool runEnabled = true;
+bool runComplete = false;
+float lastWallError = 0.0;
+unsigned long lastWallErrorMs = 0;
+bool hasLastWallError = false;
+FollowMode activeMode = MODE_NO_WALL;
+FollowMode lastControlMode = MODE_NO_WALL;
+int16_t lastWallCorrection = 0;
+
+int16_t clampMotorCommand(int16_t speed)
+{
+  return constrain(speed, -MAX_MOTOR_COMMAND, MAX_MOTOR_COMMAND);
+}
+
+void setMotorSpeeds(int16_t rf, int16_t rr, int16_t lr, int16_t lf)
+{
+  mcLower.setSpeed(RF, clampMotorCommand(rf));
+  mcLower.setSpeed(RR, clampMotorCommand(rr));
+  mcLower.setSpeed(LR, clampMotorCommand(lr));
+  mcUpper.setSpeed(LF, clampMotorCommand(lf));
+}
+
+void stopAllMotors()
+{
+  setMotorSpeeds(0, 0, 0, 0);
+}
+
+void driveBySide(int16_t leftSpeed, int16_t rightSpeed)
+{
+  setMotorSpeeds(
+      rightSpeed * FWD_RF,
+      rightSpeed * FWD_RR,
+      leftSpeed * FWD_LR,
+      leftSpeed * FWD_LF);
+}
+
+void setupMotoron(MotoronI2C &mc, uint8_t m1, uint8_t m2 = 0, uint8_t m3 = 0)
+{
+  mc.setBus(&Wire1);
+  mc.reinitialize();
+  mc.disableCrc();
+  mc.clearResetFlag();
+
+  mc.setMaxAcceleration(m1, 500);
+  mc.setMaxDeceleration(m1, 700);
+  mc.setSpeed(m1, 0);
+
+  if (m2 != 0)
+  {
+    mc.setMaxAcceleration(m2, 500);
+    mc.setMaxDeceleration(m2, 700);
+    mc.setSpeed(m2, 0);
+  }
+
+  if (m3 != 0)
+  {
+    mc.setMaxAcceleration(m3, 500);
+    mc.setMaxDeceleration(m3, 700);
+    mc.setSpeed(m3, 0);
+  }
+}
+
+void scanI2CBus(TwoWire &bus, const char *name)
+{
+  Serial.print("I2C | Scanning ");
+  Serial.println(name);
+
+  int count = 0;
+  for (uint8_t address = 1; address < 127; address++)
+  {
+    bus.beginTransmission(address);
+    uint8_t error = bus.endTransmission();
+    if (error == 0)
+    {
+      Serial.print("I2C | Found 0x");
+      if (address < 16)
+      {
+        Serial.print("0");
+      }
+      Serial.println(address, HEX);
+      count++;
+    }
+  }
+
+  if (count == 0)
+  {
+    Serial.println("I2C | No devices found.");
+  }
+}
+
+float readUltrasonicCm(UltrasonicSensor &sensor)
+{
+  digitalWrite(sensor.trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(sensor.trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(sensor.trigPin, LOW);
+
+  unsigned long duration = pulseIn(sensor.echoPin, HIGH, ULTRASONIC_TIMEOUT_US);
+  if (duration == 0)
+  {
+    return -1.0;
+  }
+
+  return duration * 0.0343 / 2.0;
+}
+
+void updateOneUltrasonic()
+{
+  if (millis() - lastUltrasonicReadMs < ULTRASONIC_SENSOR_GAP_MS)
+  {
+    return;
+  }
+
+  lastUltrasonicReadMs = millis();
+  UltrasonicSensor &sensor = ultrasonicSensors[nextUltrasonicIndex];
+  sensor.rawCm = readUltrasonicCm(sensor);
+
+  if (sensor.rawCm > 0.0 && sensor.rawCm < 350.0)
+  {
+    if (!sensor.hasFiltered)
+    {
+      sensor.filteredCm = sensor.rawCm;
+      sensor.hasFiltered = true;
+    }
+    else
+    {
+      sensor.filteredCm = ULTRASONIC_FILTER_ALPHA * sensor.rawCm +
+                          (1.0 - ULTRASONIC_FILTER_ALPHA) * sensor.filteredCm;
+    }
+  }
+
+  nextUltrasonicIndex = (nextUltrasonicIndex + 1) % NUM_ULTRASONIC;
+}
+
+void updateAllUltrasonicBlocking()
+{
+  for (uint8_t i = 0; i < NUM_ULTRASONIC; i++)
+  {
+    ultrasonicSensors[i].rawCm = readUltrasonicCm(ultrasonicSensors[i]);
+    if (ultrasonicSensors[i].rawCm > 0.0)
+    {
+      ultrasonicSensors[i].filteredCm = ultrasonicSensors[i].rawCm;
+      ultrasonicSensors[i].hasFiltered = true;
+    }
+    delay(35);
+  }
+}
+
+float distanceCm(uint8_t index)
+{
+  if (index >= NUM_ULTRASONIC || !ultrasonicSensors[index].hasFiltered)
+  {
+    return -1.0;
+  }
+  return ultrasonicSensors[index].filteredCm;
+}
+
+bool validWallDistance(float distanceCm)
+{
+  return distanceCm > 0.0 && distanceCm < WALL_VALID_MAX_CM;
+}
+
+void printDistance(float distanceCm)
+{
+  if (distanceCm < 0.0)
+  {
+    Serial.print("NA");
+  }
+  else
+  {
+    Serial.print(distanceCm, 1);
+  }
+}
+
+const char *modeName(FollowMode mode)
+{
+  switch (mode)
+  {
+    case MODE_CENTER: return "CENTER";
+    case MODE_LEFT_WALL: return "LEFT";
+    case MODE_RIGHT_WALL: return "RIGHT";
+    case MODE_NO_WALL: return "NO_WALL";
+  }
+  return "UNKNOWN";
+}
+
+FollowMode chooseFollowMode(float leftCm, float rightCm)
+{
+  bool leftValid = validWallDistance(leftCm);
+  bool rightValid = validWallDistance(rightCm);
+
+  if (leftValid && rightValid)
+  {
+    return MODE_CENTER;
+  }
+  if (leftValid)
+  {
+    return MODE_LEFT_WALL;
+  }
+  if (rightValid)
+  {
+    return MODE_RIGHT_WALL;
+  }
+  return MODE_NO_WALL;
+}
+
+bool frontBlocked(float frontCm)
+{
+  return frontCm > 0.0 && frontCm <= FRONT_STOP_CM;
+}
+
+int16_t frontLimitedBaseSpeed(float frontCm)
+{
+  if (frontCm > FRONT_STOP_CM && frontCm < FRONT_SLOW_CM)
+  {
+    return map((long)(frontCm * 10.0), (long)(FRONT_STOP_CM * 10.0), (long)(FRONT_SLOW_CM * 10.0), WALL_MIN_DRIVE_SPEED, WALL_FORWARD_SPEED);
+  }
+  return WALL_FORWARD_SPEED;
+}
+
+float computeWallError(FollowMode mode, float leftCm, float rightCm, float &kp)
+{
+  float error = 0.0; // Positive steers right, negative steers left.
+  kp = WALL_SINGLE_KP;
+  bool clearanceOverride = false;
+
+  if (mode == MODE_CENTER)
+  {
+    error = (rightCm - leftCm) * 0.5;
+    kp = WALL_CENTER_KP;
+  }
+  else if (mode == MODE_LEFT_WALL)
+  {
+    error = WALL_TARGET_CM - leftCm;
+    kp = WALL_SINGLE_KP;
+  }
+  else if (mode == MODE_RIGHT_WALL)
+  {
+    error = rightCm - WALL_TARGET_CM;
+    kp = WALL_SINGLE_KP;
+  }
+
+  if (validWallDistance(leftCm) && leftCm < WALL_MIN_CLEARANCE_CM)
+  {
+    error += (WALL_MIN_CLEARANCE_CM - leftCm) * 2.0;
+    kp = WALL_CLEARANCE_KP;
+    clearanceOverride = true;
+  }
+
+  if (validWallDistance(rightCm) && rightCm < WALL_MIN_CLEARANCE_CM)
+  {
+    error -= (WALL_MIN_CLEARANCE_CM - rightCm) * 2.0;
+    kp = WALL_CLEARANCE_KP;
+    clearanceOverride = true;
+  }
+
+  if (!clearanceOverride && error > -WALL_DEADBAND_CM && error < WALL_DEADBAND_CM)
+  {
+    error = 0.0;
+  }
+
+  return error;
+}
+
+void updateButtons()
+{
+  if (digitalRead(KILL_BUTTON_PIN) == LOW)
+  {
+    if (runEnabled)
+    {
+      Serial.println("KILL | D45 stop.");
+    }
+    runEnabled = false;
+  }
+
+  if (digitalRead(REVIVE_BUTTON_PIN) == LOW)
+  {
+    if (!runEnabled || runComplete)
+    {
+      Serial.println("REVIVE | D32 run.");
+    }
+    runEnabled = true;
+    runComplete = false;
+    runStartMs = millis();
+    hasLastWallError = false;
+    lastWallCorrection = 0;
+  }
+
+  digitalWrite(LED_RED_PIN, runEnabled && !runComplete ? LOW : HIGH);
+  digitalWrite(LED_GREEN_PIN, runEnabled && !runComplete ? HIGH : LOW);
+}
+
+void printStatus(float frontCm, float leftCm, float rightCm, float error, float kp, int16_t correction, int16_t leftSpeed, int16_t rightSpeed)
+{
+  if (millis() - lastStatusMs < STATUS_INTERVAL_MS)
+  {
+    return;
+  }
+
+  lastStatusMs = millis();
+  Serial.print("WALL_CTL | mode=");
+  Serial.print(modeName(activeMode));
+  Serial.print(" F=");
+  printDistance(frontCm);
+  Serial.print("cm L=");
+  printDistance(leftCm);
+  Serial.print("cm R=");
+  printDistance(rightCm);
+  Serial.print("cm err=");
+  Serial.print(error, 2);
+  Serial.print(" kp=");
+  Serial.print(kp, 1);
+  Serial.print(" corr=");
+  Serial.print(correction);
+  Serial.print(" speedL=");
+  Serial.print(leftSpeed);
+  Serial.print(" speedR=");
+  Serial.print(rightSpeed);
+  Serial.print(" run=");
+  Serial.println(runEnabled && !runComplete ? "RUN" : "STOP");
+}
+
+void wallFollowStep()
+{
+  if (millis() - lastControlMs < CONTROL_INTERVAL_MS)
+  {
+    return;
+  }
+  lastControlMs = millis();
+
+  float frontCm = distanceCm(0);
+  float leftCm = distanceCm(1);
+  float rightCm = distanceCm(2);
+
+  if (frontBlocked(frontCm))
+  {
+    stopAllMotors();
+    runEnabled = false;
+    Serial.print("FRONT_BLOCK | front=");
+    printDistance(frontCm);
+    Serial.println("cm. Press D32 to resume.");
+    printStatus(frontCm, leftCm, rightCm, 0.0, 0.0, 0, 0, 0);
+    hasLastWallError = false;
+    lastWallCorrection = 0;
+    return;
+  }
+
+  activeMode = chooseFollowMode(leftCm, rightCm);
+  if (activeMode != lastControlMode)
+  {
+    hasLastWallError = false;
+    lastWallCorrection = 0;
+    lastControlMode = activeMode;
+  }
+
+  if (activeMode == MODE_NO_WALL)
+  {
+    driveBySide(SEARCH_FORWARD_SPEED, SEARCH_FORWARD_SPEED);
+    printStatus(frontCm, leftCm, rightCm, 0.0, 0.0, 0, SEARCH_FORWARD_SPEED, SEARCH_FORWARD_SPEED);
+    hasLastWallError = false;
+    lastWallCorrection = 0;
+    return;
+  }
+
+  float kp = WALL_SINGLE_KP;
+  float error = computeWallError(activeMode, leftCm, rightCm, kp);
+  unsigned long now = millis();
+  float dtSec = 0.02;
+  if (hasLastWallError && now > lastWallErrorMs)
+  {
+    dtSec = (now - lastWallErrorMs) / 1000.0;
+    if (dtSec < 0.005)
+    {
+      dtSec = 0.005;
+    }
+    else if (dtSec > 0.2)
+    {
+      dtSec = 0.2;
+    }
+  }
+
+  float derivative = hasLastWallError ? (error - lastWallError) / dtSec : 0.0;
+  int16_t targetCorrection = constrain(
+      (int16_t)(kp * error + WALL_KD * derivative),
+      (int16_t)-WALL_MAX_CORRECTION,
+      (int16_t) WALL_MAX_CORRECTION);
+  int16_t correction = targetCorrection;
+  if (targetCorrection > lastWallCorrection + WALL_CORRECTION_SLEW)
+  {
+    correction = lastWallCorrection + WALL_CORRECTION_SLEW;
+  }
+  else if (targetCorrection < lastWallCorrection - WALL_CORRECTION_SLEW)
+  {
+    correction = lastWallCorrection - WALL_CORRECTION_SLEW;
+  }
+
+  int16_t baseSpeed = frontLimitedBaseSpeed(frontCm);
+  int16_t leftSpeed = constrain(
+      (int16_t)(baseSpeed + correction),
+      (int16_t)WALL_MIN_DRIVE_SPEED,
+      (int16_t)WALL_MAX_DRIVE_SPEED);
+  int16_t rightSpeed = constrain(
+      (int16_t)(baseSpeed - correction),
+      (int16_t)WALL_MIN_DRIVE_SPEED,
+      (int16_t)WALL_MAX_DRIVE_SPEED);
+
+  driveBySide(leftSpeed, rightSpeed);
+
+  lastWallError = error;
+  lastWallErrorMs = now;
+  hasLastWallError = true;
+  lastWallCorrection = correction;
+
+  printStatus(frontCm, leftCm, rightCm, error, kp, correction, leftSpeed, rightSpeed);
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(LED_RED_PIN, OUTPUT);
+  pinMode(LED_GREEN_PIN, OUTPUT);
+  pinMode(REVIVE_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(KILL_BUTTON_PIN, INPUT_PULLUP);
+  digitalWrite(LED_RED_PIN, HIGH);
+  digitalWrite(LED_GREEN_PIN, LOW);
+
+  for (uint8_t i = 0; i < NUM_ULTRASONIC; i++)
+  {
+    pinMode(ultrasonicSensors[i].trigPin, OUTPUT);
+    pinMode(ultrasonicSensors[i].echoPin, INPUT);
+    digitalWrite(ultrasonicSensors[i].trigPin, LOW);
+  }
+
+  Wire1.begin();
+  Wire1.setClock(400000);
+  scanI2CBus(Wire1, "Wire1 Motoron bus");
+
+  setupMotoron(mcLower, RF, RR, LR);
+  setupMotoron(mcUpper, LF);
+  stopAllMotors();
+
+  updateAllUltrasonicBlocking();
+  runEnabled = digitalRead(KILL_BUTTON_PIN) != LOW;
+  runStartMs = millis();
+
+  Serial.println("WALL_FOLLOWING | Ready.");
+  Serial.println("WALL_FOLLOWING | D45 stop, D32 run/resume.");
+  Serial.print("WALL_FOLLOWING | target=");
+  Serial.print(WALL_TARGET_CM, 1);
+  Serial.print("cm minClearance=");
+  Serial.print(WALL_MIN_CLEARANCE_CM, 1);
+  Serial.print("cm speed=");
+  Serial.println(WALL_FORWARD_SPEED);
+}
+
+void loop()
+{
+  updateOneUltrasonic();
+  updateButtons();
+
+  if (runComplete)
+  {
+    stopAllMotors();
+    delay(5);
+    return;
+  }
+
+  if (!runEnabled)
+  {
+    stopAllMotors();
+    delay(5);
+    return;
+  }
+
+  if (millis() - runStartMs >= RUN_TIME_LIMIT_MS)
+  {
+    stopAllMotors();
+    runComplete = true;
+    Serial.println("WALL_DONE | 45s time limit reached. Motors stopped.");
+    delay(5);
+    return;
+  }
+
+  wallFollowStep();
+  delay(2);
+}
