@@ -81,6 +81,7 @@ const unsigned long RFID_CHECK_INTERVAL_MS = 80;
 const unsigned long RFID_RETRY_INTERVAL_MS = 1000;
 const unsigned long STATUS_INTERVAL_MS = 250;
 const unsigned long SENSOR_PRINT_INTERVAL_MS = 120;
+const unsigned long STARTUP_BLINK_MS = 300;
 const unsigned int GRID_CROSS_THRESHOLD = 300;
 const unsigned int GRID_CROSS_EDGE_THRESHOLD = 280;
 const int GRID_CROSS_MIN_TOTAL = 1350;
@@ -112,6 +113,10 @@ unsigned long lastStatusMs = 0;
 unsigned long lastSensorPrintMs = 0;
 bool rfidReady = false;
 bool killStopped = false;
+bool startupWaiting = true;
+bool startupRedOn = true;
+bool ignoreD45UntilReleased = false;
+unsigned long startupLastBlinkMs = 0;
 
 enum GridState
 {
@@ -916,6 +921,37 @@ void printStatus()
   Serial.println(killStopped ? "STOP" : "RUN");
 }
 
+bool handleStartupWait()
+{
+  if (!startupWaiting)
+  {
+    return false;
+  }
+
+  stopAllMotors();
+  if (millis() - startupLastBlinkMs >= STARTUP_BLINK_MS)
+  {
+    startupLastBlinkMs = millis();
+    startupRedOn = !startupRedOn;
+  }
+  digitalWrite(LED_RED_PIN, startupRedOn ? HIGH : LOW);
+  digitalWrite(LED_GREEN_PIN, LOW);
+
+  if (digitalRead(KILL_BUTTON_PIN) == LOW)
+  {
+    startupWaiting = false;
+    ignoreD45UntilReleased = true;
+    killStopped = false;
+    stateStartMs = millis();
+    lastUpdateMicros = micros();
+    digitalWrite(LED_RED_PIN, HIGH);
+    digitalWrite(LED_GREEN_PIN, LOW);
+    Serial.println("STARTUP | D45 pressed. Algorithm enabled.");
+  }
+
+  return true;
+}
+
 void setup()
 {
   Serial.begin(115200);
@@ -961,11 +997,11 @@ void setup()
   yawDeg = 0.0;
   lastUpdateMicros = micros();
 
-  killStopped = digitalRead(KILL_BUTTON_PIN) == LOW;
-  if (killStopped)
-  {
-    Serial.println("KILL | D45 held at boot, stopped. Press D32 to run.");
-  }
+  killStopped = true;
+  startupWaiting = true;
+  startupRedOn = true;
+  startupLastBlinkMs = millis();
+  Serial.println("GRID_OBS | Startup: motors stopped, red blinks. Press D45 once to start.");
   enterState(WAIT_OBSTACLE);
 }
 
@@ -975,7 +1011,21 @@ void loop()
   updateUltrasonic();
   updateRFIDReady();
 
-  if (digitalRead(KILL_BUTTON_PIN) == LOW)
+  if (handleStartupWait())
+  {
+    printStatus();
+    delay(5);
+    return;
+  }
+
+  if (ignoreD45UntilReleased)
+  {
+    if (digitalRead(KILL_BUTTON_PIN) == HIGH)
+    {
+      ignoreD45UntilReleased = false;
+    }
+  }
+  else if (digitalRead(KILL_BUTTON_PIN) == LOW)
   {
     killStopped = true;
   }
@@ -984,8 +1034,8 @@ void loop()
     killStopped = false;
   }
 
-  digitalWrite(LED_RED_PIN, killStopped ? HIGH : LOW);
-  digitalWrite(LED_GREEN_PIN, killStopped ? LOW : HIGH);
+  digitalWrite(LED_RED_PIN, HIGH);
+  digitalWrite(LED_GREEN_PIN, LOW);
 
   if (killStopped)
   {
