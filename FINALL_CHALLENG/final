@@ -1,10 +1,3 @@
-
-// VERSION: LINE_FOLLOWER_9OUT_AUTO_BRANCH_TEST_WIFI_OPTION_V6
-// Loaded from saved_versions/line_follower_working_2026-05-19.cpp.
-// Current test changes: 9-output reflectance auto branch test, optional server mode.
-// When an outer sensor sees a strong branch, move forward a little, read the
-// branch pattern, then turn left or right if forward is not available.
-
 #include <Arduino.h>
 #include <math.h>
 #include <Wire.h>
@@ -24,8 +17,6 @@ const bool RFID_ONLY_TEST = false;
 const bool MOTOR_FULL_SPEED_TEST = false;
 const bool LF_MOTOR_ENCODER_TEST = false;
 
-// Physical stack order is reversed on the rebuilt robot:
-// the three-motor shield is now at 0x11, and the one-motor shield is at 0x10.
 const uint8_t LOWER_MOTORON_ADDR = 0x11;
 const uint8_t UPPER_MOTORON_ADDR = 0x10;
 
