@@ -10,7 +10,7 @@
 
 const bool SERVO_TEST = false;
 const bool USE_SEED_PLANTER = true;
-const bool OFFLINE_MODE = false; // true = no WiFi/server; RFID uses local fallback.
+const bool OFFLINE_MODE = true; // true = no WiFi/server; RFID uses local fallback.
 const bool USE_SERVER_MESSENGER = !OFFLINE_MODE;
 const bool ALLOW_LOCAL_RFID_FALLBACK = OFFLINE_MODE;
 const bool RFID_ONLY_TEST = false;
@@ -50,10 +50,10 @@ const uint8_t LR = 3;
 const uint8_t LF = 1;
 
 // Raw Motoron polarity for physical forward motion.
-const int8_t FWD_RF = -1;
-const int8_t FWD_RR = 1;
-const int8_t FWD_LR = -1;
-const int8_t FWD_LF = -1;
+const int8_t FWD_RF = 1;
+const int8_t FWD_RR = -1;
+const int8_t FWD_LR = 1;
+const int8_t FWD_LF = 1;
 
 // Reflectance board using only OUT1/OUT3/OUT5/OUT7/OUT9, right to left.
 // OUT2/OUT4/OUT6/OUT8 are intentionally not read.
