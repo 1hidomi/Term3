@@ -1,6 +1,6 @@
 // Standalone back-to-base emergency-return test.
-// Starts at arena entry (7,0), drives forward for 3 seconds, then returns to exit (3,0).
-// Uses black-line PID tracking while y <= 4. For y > 4, uses IMU yaw hold plus RFID/encoder.
+// Starts at arena entry (7,0), drives forward for 3 RFID nodes, then returns to exit (3,0).
+// Uses black-line PID tracking while y <= 4. For y > 4, uses IMU yaw hold. RFID cards count nodes.
 // Build/upload with: pio run -e back_to_base -t upload
 
 #include <Arduino.h>
@@ -68,15 +68,23 @@ const int16_t RANDOM_FORWARD_SPEED = 360;
 const int16_t RETURN_SPEED = 360;
 const int16_t LINE_RETURN_SPEED = 330;
 const int16_t LINE_LOST_YAW_SPEED = 300;
-const int16_t RETURN_TURN_SPEED = 540;
-const int16_t RETURN_FINE_TURN_SPEED = 430;
+const int16_t RETURN_TURN_FAST_SPEED = 560;
+const int16_t RETURN_TURN_MID_SPEED = 500;
+const int16_t RETURN_TURN_FINE_SPEED = 340;
+const int16_t RETURN_TURN_RELIEF_SPEED = 420;
 const int16_t RETURN_MAX_CORRECTION = 130;
 const float RETURN_YAW_KP = 16.0;
 const float RETURN_TURN_TOLERANCE_DEG = 3.0;
-const uint16_t RETURN_TURN_SETTLE_MS = 160;
-const uint16_t RETURN_TURN_TIMEOUT_MS = 9000;
-const unsigned long RANDOM_DRIVE_MS = 3000;
-const unsigned long NODE_TIMEOUT_MS = 3200;
+const float RETURN_TURN_MID_REMAINING_DEG = 28.0;
+const float RETURN_TURN_FINE_REMAINING_DEG = 9.0;
+const float RETURN_TURN_SEGMENT_DEG = 12.0;
+const uint16_t RETURN_TURN_SEGMENT_STOP_MS = 70;
+const uint16_t RETURN_TURN_RELIEF_PULSE_MS = 80;
+const uint16_t RETURN_TURN_SETTLE_MS = 180;
+const uint16_t RETURN_TURN_TIMEOUT_MS = 14000;
+const uint8_t START_FORWARD_NODES = 3;
+const unsigned long START_RFID_IGNORE_MS = 1;
+const unsigned long NODE_TIMEOUT_MS = 6500;
 const long NODE_ENCODER_TICKS = 160;
 const unsigned int SENSOR_TIMEOUT_US = 3000;
 const bool BLACK_LINE_IS_HIGH = true;
@@ -92,6 +100,7 @@ const unsigned long RFID_CHECK_INTERVAL_MS = 80;
 const unsigned long RFID_RETRY_INTERVAL_MS = 1000;
 const unsigned long NODE_REPEAT_MS = 900;
 const unsigned long STATUS_INTERVAL_MS = 250;
+const unsigned long SENSOR_MONITOR_INTERVAL_MS = 100;
 const unsigned long STARTUP_BLINK_MS = 300;
 const unsigned long RUN_TIME_LIMIT_MS = 60000;
 
@@ -106,20 +115,39 @@ enum BackState
   FAILED
 };
 
+enum ReturnTurnPhase
+{
+  RETURN_TURN_APPROACH,
+  RETURN_TURN_SEGMENT_STOP,
+  RETURN_TURN_RELIEF_FORWARD,
+  RETURN_TURN_RELIEF_BACKWARD,
+  RETURN_TURN_SETTLE,
+  RETURN_TURN_FINE_CORRECT
+};
+
 BackState state = RANDOM_FORWARD;
 unsigned long stateStartMs = 0;
 unsigned long runStartMs = 0;
 unsigned long lastRFIDCheckMs = 0;
 unsigned long lastRFIDRetryMs = 0;
 unsigned long lastStatusMs = 0;
+unsigned long lastSensorMonitorMs = 0;
 unsigned long turnSettleStartMs = 0;
 unsigned long nodeStartMs = 0;
 unsigned long startupLastBlinkMs = 0;
+unsigned long returnTurnPhaseStartMs = 0;
+unsigned long lastReturnTurnPrintMs = 0;
 bool startupWaiting = true;
 bool startupRedOn = true;
 bool ignoreD45UntilReleased = false;
 bool killStopped = true;
 bool rfidReady = false;
+bool returnTurnActive = false;
+bool returnTurnNextReliefForward = true;
+ReturnTurnPhase returnTurnPhase = RETURN_TURN_APPROACH;
+float returnTurnStartYawDeg = 0.0;
+float returnTurnTargetDeltaDeg = 0.0;
+float returnTurnSegmentTargetDeg = 0.0;
 
 unsigned int sensorValues[SENSOR_COUNT] = {0, 0, 0, 0, 0};
 bool sensorOnLine[SENSOR_COUNT] = {false, false, false, false, false};
@@ -268,6 +296,35 @@ bool computeLineError(float &error)
 
   error = (float)weightedSum / (float)signalTotal;
   return true;
+}
+
+void monitorReflectanceSensors()
+{
+  if (millis() - lastSensorMonitorMs < SENSOR_MONITOR_INTERVAL_MS)
+  {
+    return;
+  }
+
+  lastSensorMonitorMs = millis();
+  readSensors();
+  Serial.print("QTR_MON ");
+  for (uint8_t i = 0; i < SENSOR_COUNT; i++)
+  {
+    Serial.print(SENSOR_NAMES[i]);
+    Serial.print("(D");
+    Serial.print(SENSOR_PINS[i]);
+    Serial.print(")=");
+    Serial.print(sensorValues[i]);
+    Serial.print(sensorOnLine[i] ? "*" : " ");
+    if (i + 1 < SENSOR_COUNT)
+    {
+      Serial.print(" ");
+    }
+  }
+  Serial.print(" | threshold=");
+  Serial.print(LINE_THRESHOLD);
+  Serial.print(" floor=");
+  Serial.println(LINE_SIGNAL_FLOOR);
 }
 
 void driveLinePid(float error)
@@ -587,6 +644,8 @@ void printPosition(const char *source)
   Serial.println(positionKnown ? "YES" : "NO");
 }
 
+void fail(const char *reason);
+
 void advancePositionOneNode(const char *source)
 {
   if (!positionKnown)
@@ -611,14 +670,30 @@ void advancePositionOneNode(const char *source)
 
 bool countNodeByRFID(const char *source)
 {
-  if (!rfidReady || millis() - lastRFIDCheckMs < RFID_CHECK_INTERVAL_MS)
+  unsigned long now = millis();
+  if (!rfidReady || now - lastRFIDCheckMs < RFID_CHECK_INTERVAL_MS)
   {
     return false;
   }
-  lastRFIDCheckMs = millis();
+  lastRFIDCheckMs = now;
 
   uint32_t uidHash = 0;
-  if (!readRFIDCard(uidHash) || !acceptUniqueRFID(uidHash))
+  if (!readRFIDCard(uidHash))
+  {
+    return false;
+  }
+
+  if (state == RANDOM_FORWARD && randomNodesCounted == 0 && now - stateStartMs < START_RFID_IGNORE_MS)
+  {
+    haveLastNodeUid = true;
+    lastNodeUid = uidHash;
+    lastNodeUidMs = now;
+    Serial.print("NODE | Start-card ignored uid=0x");
+    Serial.println(uidHash, HEX);
+    return false;
+  }
+
+  if (!acceptUniqueRFID(uidHash))
   {
     return false;
   }
@@ -638,6 +713,23 @@ bool countNodeByRFID(const char *source)
   Serial.print(targetNodes);
   Serial.print(" uid=0x");
   Serial.println(uidHash, HEX);
+  return true;
+}
+
+bool checkNodeRFIDTimeout(const char *source)
+{
+  if (millis() - nodeStartMs < NODE_TIMEOUT_MS)
+  {
+    return false;
+  }
+
+  Serial.print("NODE | RFID timeout while waiting for node ");
+  Serial.print(nodesTravelled + 1);
+  Serial.print("/");
+  Serial.print(targetNodes);
+  Serial.print(" source=");
+  Serial.println(source);
+  fail("RFID node timeout.");
   return true;
 }
 
@@ -706,6 +798,10 @@ void updateRFIDReady()
 
 void enterState(BackState nextState)
 {
+  if (nextState != ALIGN_X && nextState != ALIGN_Y)
+  {
+    returnTurnActive = false;
+  }
   state = nextState;
   stateStartMs = millis();
   turnSettleStartMs = 0;
@@ -787,6 +883,107 @@ void driveYawHold(int16_t baseSpeed)
   driveBySide(leftSpeed, rightSpeed);
 }
 
+const char *returnTurnPhaseName(ReturnTurnPhase phase)
+{
+  switch (phase)
+  {
+    case RETURN_TURN_APPROACH: return "APPROACH";
+    case RETURN_TURN_SEGMENT_STOP: return "SEGMENT_STOP";
+    case RETURN_TURN_RELIEF_FORWARD: return "RELIEF_FORWARD";
+    case RETURN_TURN_RELIEF_BACKWARD: return "RELIEF_BACKWARD";
+    case RETURN_TURN_SETTLE: return "SETTLE";
+    case RETURN_TURN_FINE_CORRECT: return "FINE_CORRECT";
+  }
+  return "UNKNOWN";
+}
+
+float returnTurnErrorDeg()
+{
+  return normalizeAngleDeg(targetYawDeg - yawDeg);
+}
+
+float returnTurnProgressDeg()
+{
+  return fabs(normalizeAngleDeg(yawDeg - returnTurnStartYawDeg));
+}
+
+float limitedReturnTurnSegmentTarget(float currentDeg)
+{
+  float target = currentDeg + RETURN_TURN_SEGMENT_DEG;
+  if (target > returnTurnTargetDeltaDeg)
+  {
+    target = returnTurnTargetDeltaDeg;
+  }
+  return target;
+}
+
+int16_t returnTurnSpeedForError(float errorAbs)
+{
+  if (errorAbs > RETURN_TURN_MID_REMAINING_DEG)
+  {
+    return RETURN_TURN_FAST_SPEED;
+  }
+
+  if (errorAbs > RETURN_TURN_FINE_REMAINING_DEG)
+  {
+    return RETURN_TURN_MID_SPEED;
+  }
+
+  return RETURN_TURN_FINE_SPEED;
+}
+
+void enterReturnTurnPhase(ReturnTurnPhase nextPhase)
+{
+  returnTurnPhase = nextPhase;
+  returnTurnPhaseStartMs = millis();
+  Serial.print("RETURN_TURN_PHASE | ");
+  Serial.println(returnTurnPhaseName(returnTurnPhase));
+}
+
+void beginReturnTurn()
+{
+  returnTurnStartYawDeg = yawDeg;
+  returnTurnTargetDeltaDeg = fabs(normalizeAngleDeg(targetYawDeg - returnTurnStartYawDeg));
+  returnTurnSegmentTargetDeg = limitedReturnTurnSegmentTarget(0.0);
+  returnTurnNextReliefForward = true;
+  returnTurnActive = true;
+  lastReturnTurnPrintMs = 0;
+  enterReturnTurnPhase(RETURN_TURN_APPROACH);
+
+  Serial.print("RETURN_TURN | targetHeading=");
+  Serial.print(headingName(targetHeading));
+  Serial.print(" startYaw=");
+  Serial.print(returnTurnStartYawDeg, 1);
+  Serial.print(" targetYaw=");
+  Serial.print(targetYawDeg, 1);
+  Serial.print(" delta=");
+  Serial.println(returnTurnTargetDeltaDeg, 1);
+}
+
+void printReturnTurnStatus(int16_t speedCommand)
+{
+  if (millis() - lastReturnTurnPrintMs < STATUS_INTERVAL_MS)
+  {
+    return;
+  }
+
+  lastReturnTurnPrintMs = millis();
+  Serial.print("RETURN_TURN | phase=");
+  Serial.print(returnTurnPhaseName(returnTurnPhase));
+  Serial.print(" yaw=");
+  Serial.print(yawDeg, 1);
+  Serial.print(" progress=");
+  Serial.print(returnTurnProgressDeg(), 1);
+  Serial.print("/");
+  Serial.print(returnTurnTargetDeltaDeg, 1);
+  Serial.print(" error=");
+  Serial.print(returnTurnErrorDeg(), 1);
+  Serial.print(" speed=");
+  Serial.print(speedCommand);
+  Serial.print(" segmentTarget=");
+  Serial.println(returnTurnSegmentTargetDeg, 1);
+}
+
 bool blackLineAvailableHere()
 {
   return robotGridY <= 4;
@@ -833,52 +1030,146 @@ void randomForwardStep()
 {
   setTargetHeading(GRID_HEADING_NORTH);
   driveByBestAvailableGuide(RANDOM_FORWARD_SPEED);
-  countNodeByRFID("RANDOM_RFID") ||
-      countNodeByEncoder("RANDOM_ENCODER");
+  countNodeByRFID("START_RFID");
 
-  if (millis() - stateStartMs >= RANDOM_DRIVE_MS)
+  if (randomNodesCounted >= START_FORWARD_NODES)
   {
     stopAllMotors();
-    if (randomNodesCounted == 0)
-    {
-      advancePositionOneNode("RANDOM_3S_ASSUME");
-      randomNodesCounted++;
-    }
-    Serial.print("RANDOM | Complete. nodes=");
+    Serial.print("START | Complete. RFID nodes=");
     Serial.println(randomNodesCounted);
     planNextLeg();
+    return;
   }
+
+  checkNodeRFIDTimeout("START_FORWARD");
 }
 
 void alignStep(BackState driveState)
 {
-  float yawError = normalizeAngleDeg(targetYawDeg - yawDeg);
-  if (fabs(yawError) <= RETURN_TURN_TOLERANCE_DEG)
+  if (!returnTurnActive)
   {
-    stopAllMotors();
-    if (turnSettleStartMs == 0)
-    {
-      turnSettleStartMs = millis();
-      return;
-    }
+    beginReturnTurn();
+  }
 
-    if (millis() - turnSettleStartMs >= RETURN_TURN_SETTLE_MS)
-    {
-      robotGridHeading = targetHeading;
-      printPosition("HEADING_LOCK");
-      beginNodeDrive(driveState, targetNodes);
-    }
+  unsigned long now = millis();
+  if (now - stateStartMs >= RETURN_TURN_TIMEOUT_MS)
+  {
+    fail("Segmented turn timeout.");
     return;
   }
 
-  if (millis() - stateStartMs >= RETURN_TURN_TIMEOUT_MS)
+  float yawError = returnTurnErrorDeg();
+  float errorAbs = fabs(yawError);
+  float progressDeg = returnTurnProgressDeg();
+  int16_t speedCommand = 0;
+
+  switch (returnTurnPhase)
   {
-    fail("Turn timeout.");
-    return;
+    case RETURN_TURN_APPROACH:
+      if (errorAbs <= RETURN_TURN_TOLERANCE_DEG)
+      {
+        stopAllMotors();
+        enterReturnTurnPhase(RETURN_TURN_SETTLE);
+      }
+      else if (progressDeg >= returnTurnSegmentTargetDeg && errorAbs > RETURN_TURN_FINE_REMAINING_DEG)
+      {
+        stopAllMotors();
+        enterReturnTurnPhase(RETURN_TURN_SEGMENT_STOP);
+      }
+      else
+      {
+        speedCommand = returnTurnSpeedForError(errorAbs);
+        pivotDirection(yawError > 0.0 ? -1 : 1, speedCommand);
+      }
+      break;
+
+    case RETURN_TURN_SEGMENT_STOP:
+      stopAllMotors();
+      if (now - returnTurnPhaseStartMs >= RETURN_TURN_SEGMENT_STOP_MS)
+      {
+        yawError = returnTurnErrorDeg();
+        errorAbs = fabs(yawError);
+        if (errorAbs <= RETURN_TURN_TOLERANCE_DEG)
+        {
+          enterReturnTurnPhase(RETURN_TURN_SETTLE);
+        }
+        else if (errorAbs <= RETURN_TURN_FINE_REMAINING_DEG)
+        {
+          returnTurnSegmentTargetDeg = limitedReturnTurnSegmentTarget(returnTurnProgressDeg());
+          enterReturnTurnPhase(RETURN_TURN_APPROACH);
+        }
+        else if (returnTurnNextReliefForward)
+        {
+          enterReturnTurnPhase(RETURN_TURN_RELIEF_FORWARD);
+        }
+        else
+        {
+          enterReturnTurnPhase(RETURN_TURN_RELIEF_BACKWARD);
+        }
+      }
+      break;
+
+    case RETURN_TURN_RELIEF_FORWARD:
+      speedCommand = RETURN_TURN_RELIEF_SPEED;
+      driveForward(RETURN_TURN_RELIEF_SPEED);
+      if (now - returnTurnPhaseStartMs >= RETURN_TURN_RELIEF_PULSE_MS)
+      {
+        stopAllMotors();
+        returnTurnNextReliefForward = false;
+        returnTurnSegmentTargetDeg = limitedReturnTurnSegmentTarget(returnTurnProgressDeg());
+        enterReturnTurnPhase(RETURN_TURN_APPROACH);
+      }
+      break;
+
+    case RETURN_TURN_RELIEF_BACKWARD:
+      speedCommand = -RETURN_TURN_RELIEF_SPEED;
+      driveForward(-RETURN_TURN_RELIEF_SPEED);
+      if (now - returnTurnPhaseStartMs >= RETURN_TURN_RELIEF_PULSE_MS)
+      {
+        stopAllMotors();
+        returnTurnNextReliefForward = true;
+        returnTurnSegmentTargetDeg = limitedReturnTurnSegmentTarget(returnTurnProgressDeg());
+        enterReturnTurnPhase(RETURN_TURN_APPROACH);
+      }
+      break;
+
+    case RETURN_TURN_SETTLE:
+      stopAllMotors();
+      if (now - returnTurnPhaseStartMs >= RETURN_TURN_SETTLE_MS)
+      {
+        yawError = returnTurnErrorDeg();
+        errorAbs = fabs(yawError);
+        if (errorAbs <= RETURN_TURN_TOLERANCE_DEG)
+        {
+          returnTurnActive = false;
+          robotGridHeading = targetHeading;
+          printPosition("HEADING_LOCK");
+          beginNodeDrive(driveState, targetNodes);
+        }
+        else
+        {
+          enterReturnTurnPhase(RETURN_TURN_FINE_CORRECT);
+        }
+      }
+      break;
+
+    case RETURN_TURN_FINE_CORRECT:
+      yawError = returnTurnErrorDeg();
+      errorAbs = fabs(yawError);
+      if (errorAbs <= RETURN_TURN_TOLERANCE_DEG)
+      {
+        stopAllMotors();
+        enterReturnTurnPhase(RETURN_TURN_SETTLE);
+      }
+      else
+      {
+        speedCommand = RETURN_TURN_FINE_SPEED;
+        pivotDirection(yawError > 0.0 ? -1 : 1, speedCommand);
+      }
+      break;
   }
 
-  int16_t speed = fabs(yawError) > 18.0 ? RETURN_TURN_SPEED : RETURN_FINE_TURN_SPEED;
-  pivotDirection(yawError > 0.0 ? -1 : 1, speed);
+  printReturnTurnStatus(speedCommand);
 }
 
 void driveNodesStep()
@@ -890,13 +1181,16 @@ void driveNodesStep()
     return;
   }
 
-  bool counted = countNodeByRFID("RETURN_RFID") ||
-                 countNodeByEncoder("RETURN_ENCODER") ||
-                 countNodeByTimeout("RETURN_TIMEOUT");
+  bool counted = countNodeByRFID("RETURN_RFID");
   if (counted && nodesTravelled >= targetNodes)
   {
     stopAllMotors();
     planNextLeg();
+    return;
+  }
+
+  if (!counted && checkNodeRFIDTimeout("RETURN"))
+  {
     return;
   }
 
@@ -1007,6 +1301,10 @@ bool handleStartupWait()
     runStartMs = millis();
     stateStartMs = millis();
     nodeStartMs = millis();
+    nodesTravelled = 0;
+    randomNodesCounted = 0;
+    targetNodes = START_FORWARD_NODES;
+    haveLastNodeUid = false;
     copyEncoderCounts(nodeStartEncoderCounts);
     copyEncoderCounts(lastStatusEncoderCounts);
     lastUpdateMicros = micros();
@@ -1054,6 +1352,9 @@ void setup()
   robotGridHeading = GRID_HEADING_NORTH;
   setTargetHeading(GRID_HEADING_NORTH);
   state = RANDOM_FORWARD;
+  targetNodes = START_FORWARD_NODES;
+  nodesTravelled = 0;
+  randomNodesCounted = 0;
   stateStartMs = millis();
   nodeStartMs = millis();
   startupWaiting = true;
@@ -1062,8 +1363,8 @@ void setup()
   startupLastBlinkMs = millis();
 
   Serial.println("BACK_TO_BASE | Ready.");
-  Serial.println("BACK_TO_BASE | Press D45: drive forward 3s from entry (7,0), then return to exit (3,0).");
-  Serial.println("BACK_TO_BASE | y<=4 uses black-line PID; y>4 uses IMU yaw hold. RFID/encoder count nodes.");
+  Serial.println("BACK_TO_BASE | Press D45: drive forward 3 RFID nodes from entry (7,0), then return to exit (3,0).");
+  Serial.println("BACK_TO_BASE | y<=4 uses black-line PID; y>4 uses IMU yaw hold. RFID cards count nodes.");
   Serial.print("BACK_TO_BASE | Speeds random=");
   Serial.print(RANDOM_FORWARD_SPEED);
   Serial.print(" return=");
@@ -1080,11 +1381,13 @@ void loop()
 
   if (handleStartupWait())
   {
+    monitorReflectanceSensors();
     printStatus();
     return;
   }
 
   updateButtons();
+  monitorReflectanceSensors();
 
   if (killStopped)
   {
