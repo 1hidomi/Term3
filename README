@@ -1,8 +1,10 @@
 1. Repository Structure
 
-├── latest.ino                     # Main Arduino deployment script
+├── final                          # Main Arduino deployment script
+├── platform_io                    # header file
+├── secret.h                       # header file
 ├── README.md                      # Setup and documentation manual
-├── software_overview_diagram      # Software architecture diagram
+├── software_overview_diagram.png  # Software architecture diagram
 ├── flowcharts                     # Robot decision-flow diagrams
     └─ mechanical_kill_switch.png
     └─ RFID_planting.png
