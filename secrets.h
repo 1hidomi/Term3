@@ -3,4 +3,4 @@
 #define BROKER_HOST "192.168.0.74"
 #define BROKER_PORT 1883
 #define GROUP_ID "5"
-#define BOARD_ID "Thomas"
+#define BOARD_ID "Igor5"
