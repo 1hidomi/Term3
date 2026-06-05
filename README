@@ -9,17 +9,17 @@ The codebase is developed as a PlatformIO project. The public GitHub submission
 also contains exported top-level source files, diagrams, and testing evidence for
 review.
 
-|-- final.cpp                      
-|-- planting.cpp                     # Standalone field planting controller
-|-- return_to_base.cpp               # Standalone emergency return test
-|-- platform_io                      # PlatformIO configuration used for export
-|-- secrets.h                        # Header file
-|-- software_overview_diagram.png    # Software architecture diagram
-|-- flowcharts/
-|   |-- mechanical_kill_switch.png
-|   |-- RFID_planting.png
-|   `-- line_following.png
-`-- Testing_Calibration_Evidence/    # Logs, screenshots, and field-test videos
+|—— final.cpp                      
+|—— planting.cpp                     # Standalone field planting controller
+|—— return_to_base.cpp               # Standalone emergency return test
+|—— platform_io                      # PlatformIO configuration used for export
+|—— secrets.h                        # Header file
+|—— software_overview_diagram.png    
+|—— flowcharts/
+|   |—— mechanical_kill_switch.png
+|   |—— RFID_planting.png
+|   |—— line_following.png
+|—— Testing_Calibration_Evidence     # Logs, screenshots, and field-test videos
 
 
 Main Controller Behavior
@@ -53,32 +53,27 @@ Keep `secrets.h` in the same sketch folder as the final `.ino` file.
 Do not commit real Wi-Fi, broker, team, or board credentials. Use a private local
 file like this:
 
-```
+
 #pragma once
 
 #define WIFI_SSID "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 #define BROKER_HOST "YOUR_BROKER_HOST_OR_IP"
 #define BROKER_PORT 1883
-#define GROUP_ID "YOUR_TEAM_OR_GROUP_ID"
-#define BOARD_ID "YOUR_BOARD_ID"
-```
+#define GROUP_ID "5"
+#define BOARD_ID "Igor5"
+
 
 Build And Upload
 
 Default integrated controller:
-
-```
 pio run
 pio run -t upload
 pio device monitor -e giga_r1_m7 --port /dev/cu.usbmodem101 --baud 115200
-```
+
 
 If `pio` is not on the shell path, use the PlatformIO virtualenv executable:
-
-```
 /Users/admin/.platformio/penv/bin/platformio run
-```
 
 Useful PlatformIO environments:
 
@@ -93,16 +88,12 @@ Useful PlatformIO environments:
 | `encoder_speed_diagnostic` | Encoder speed and wheel response diagnostic |
 
 Example:
-
-```
 pio run -e back_to_base
 pio run -e pre_emergency_planting -t upload
-```
 
 Arduino IDE Export
 
 PlatformIO is the preferred development path. For a final Arduino IDE submission:
-
 1. Copy the validated integrated source into a sketch file such as `final.ino`.
 2. Put a private `secrets.h` tab in the same sketch folder.
 3. Install the required libraries listed above.
@@ -123,14 +114,12 @@ Operating Checklist
 Server Message Flow
 
 Outgoing messages:
-
 - `type=register`
 - `type=openAirlock`
 - `type=isFertile`
 - `type=seedPlanted`
 
 Incoming messages handled by the robot:
-
 - `type=heartbeat enable=...`
 - `type=disable enabled=...`
 - `type=emergency enabled=...`
@@ -143,19 +132,12 @@ disable, and RFID replies are processed promptly.
 Testing And Evidence
 
 Run a compile before submitting code changes:
-
-```
 pio run
-```
 
 Capture serial evidence with:
-
-```
 pio device monitor -e giga_r1_m7 --port /dev/cu.usbmodem101 --baud 115200
-```
 
 Recommended evidence:
-
 - PlatformIO compile success.
 - Startup log showing IMU, Motoron, RFID, ultrasonic, and sensor initialization.
 - Reflectance calibration on black line and floor.
