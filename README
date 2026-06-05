@@ -1,7 +1,7 @@
-Autonomous Arduino GIGA R1 WiFi robot software for the Term 3 arena challenge.
 The current integrated controller combines black-line navigation, IMU-guided turning, RFID checkpoint handling, MiniMessenger server communication, ultrasonic obstacle awareness, wall following, seed planting, and emergency return behavior.
-
 The codebase is developed as a PlatformIO project. The public GitHub submission also contains exported top-level source files, diagrams, and testing evidence for review.
+
+Repository Structure
 
 |—— final.cpp                      
 |—— planting.cpp                     # Standalone field planting controller
@@ -52,27 +52,13 @@ Keep `secrets.h` in the same sketch folder as the final `.cpp` file.
 Build And Upload
 
 Default integrated controller:
-pio run
 pio run -t upload
 pio device monitor -e giga_r1_m7 --port /dev/cu.usbmodem101 --baud 115200
 
 If `pio` is not on the shell path, use the PlatformIO virtualenv executable:
 /Users/admin/.platformio/penv/bin/platformio run
-
-Useful PlatformIO environments:
-| Environment | Purpose |
-|---|---|
-| `giga_r1_m7` | Default integrated controller from `src/main.cpp` |
-| `pre_emergency_planting` | Standalone seed planting and field exploration |
-| `back_to_base` | Standalone emergency return-to-base test |
-| `follow_line` / `fast_pid_line` | Line follower experiments |
-| `wall_following` | Tunnel wall-following experiment |
-| `obstacle_avoid` | Ultrasonic obstacle behavior experiment |
-| `encoder_speed_diagnostic` | Encoder speed and wheel response diagnostic |
-
 Example:
-pio run -e back_to_base
-pio run -e pre_emergency_planting -t upload
+pio run -e final -t upload
 
 Arduino IDE Export
 
