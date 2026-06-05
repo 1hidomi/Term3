@@ -1,5 +1,4 @@
 #include <Arduino.h>
-
 #include <math.h>
 #include <Wire.h>
 #include <Motoron.h>
@@ -81,7 +80,6 @@ const uint8_t LOGICAL_SENSOR_INDEXES[LOGICAL_SENSOR_COUNT] = {
 const uint8_t ENCODER_COUNT = 4;
 const uint8_t ENC_A[ENCODER_COUNT] = {18, 2, 4, 8};
 const uint8_t ENC_B[ENCODER_COUNT] = {19, 3, 5, 9};
-
 const uint8_t US_FRONT_ECHO = 37;
 const uint8_t US_FRONT_TRIG = 39;
 const uint8_t US_LEFT_ECHO = 52;
